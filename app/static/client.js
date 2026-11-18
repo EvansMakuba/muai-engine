@@ -1,89 +1,134 @@
-// Client integration for MuAI Hackathon Demo
 const API_BASE = window.location.origin;
 const USER_ID = "kevin";
 
-// 1. Fetch live user state (Aura, Escrow, Battery)
+// 1. Refresh Aura, Escrow & Battery
 async function refreshState() {
   try {
     const res = await fetch(`${API_BASE}/api/state/${USER_ID}`);
     if (!res.ok) return;
     const data = await res.json();
-    
-    // Update Profile / Ledger figures if present in DOM
-    const auraEls = document.querySelectorAll('.mc-aura .mc-val, .lh-val');
-    auraEls.forEach(el => el.innerText = data.aura);
-    
-    const walletEls = document.querySelectorAll('.wallet-card .w-val');
-    walletEls.forEach(el => el.innerText = `KES ${data.escrow_kes.toLocaleString()}`);
+    document.querySelectorAll('.mc-aura .mc-val').forEach(el => el.innerText = data.aura);
+    document.querySelectorAll('.wallet-card .w-val').forEach(el => el.innerText = `KES ${data.escrow_kes.toLocaleString()}`);
   } catch (err) {
-    console.error("State refresh failed:", err);
+    console.error("State sync failed:", err);
   }
 }
 
-// 2. Send Chat to DeepSeek
-async function sendChatMessage(customMsg = null) {
+// 2. Fetch and render Live MyHuman Feed
+async function loadFeed(category = "all") {
+  const container = document.getElementById('feed-container');
+  if (!container) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/feed${category !== 'all' ? '?category=' + encodeURIComponent(category) : ''}`);
+    const posts = await res.json();
+    container.innerHTML = "";
+    posts.forEach(p => {
+      const card = document.createElement('div');
+      card.className = "c-post";
+      card.onclick = () => loadThread(p.id);
+      card.innerHTML = `
+        <div class="c-meta"><b>${p.category}</b> • ${p.author_agent} • just now</div>
+        <div class="c-title">${p.title}</div>
+        <div class="c-body">${p.body}</div>
+        <div class="c-foot"><span>${p.comments_count} Agent Bids</span><span>View Negotiation Thread →</span></div>
+      `;
+      container.appendChild(card);
+    });
+  } catch (err) {
+    console.error("Feed load failed:", err);
+  }
+}
+
+// 3. Load Live Negotiation Thread
+async function loadThread(postId) {
+  try {
+    const res = await fetch(`${API_BASE}/api/thread/${postId}`);
+    const data = await res.json();
+    const p = data.post;
+    
+    let html = `
+      <div class="thread-head">
+        <div class="c-meta" style="color:var(--muted); font-size:10px; margin-bottom:4px;">${p.category} • ${p.author_agent}</div>
+        <div class="thread-title">${p.title}</div>
+        <div class="thread-desc">${p.body}</div>
+      </div>
+      <div class="comment-tree">
+    `;
+    data.comments.forEach((c, idx) => {
+      html += `
+        <div class="comment indent-${Math.min(idx, 2)}">
+          <div class="c-auth"><span>${c.agent_id}</span><span class="aura-tag">• Aura: ${c.aura_score}</span></div>
+          <div class="c-text">${c.comment_text}</div>
+          <div class="c-sys">${c.sys_action}</div>
+        </div>
+      `;
+    });
+    html += `<div class="consensus-banner">✓ Contract Equilibrium Reached. State Committed.</div></div>`;
+    
+    document.getElementById('thread-content').innerHTML = html;
+    switchScreen('thread');
+  } catch (err) {
+    alert("Failed to load thread: " + err);
+  }
+}
+
+// 4. Send Message to Agent & Render Live Deal
+async function sendChatMessage() {
   const input = document.querySelector('.chat-input-pill input');
-  const message = customMsg || input.value.trim();
+  const message = input.value.trim();
   if (!message) return;
-  
-  if (!customMsg) input.value = "";
+  input.value = "";
   
   const chatBody = document.querySelector('.chat-body');
   
-  // Render user bubble
-  const userBubble = document.createElement('div');
-  userBubble.className = 'msg user';
-  userBubble.innerText = message;
-  chatBody.appendChild(userBubble);
-  chatBody.scrollTop = chatBody.scrollHeight;
+  // User bubble
+  const userEl = document.createElement('div');
+  userEl.className = 'msg user';
+  userEl.innerText = message;
+  chatBody.appendChild(userEl);
   
-  // Render loading placeholder
-  const loadingBubble = document.createElement('div');
-  loadingBubble.className = 'msg ai';
-  loadingBubble.innerHTML = '<span class="sys-action">[DeepSeek: Cognitive Reasoning...]</span> Thinking...';
-  chatBody.appendChild(loadingBubble);
+  // Thinking bubble
+  const aiEl = document.createElement('div');
+  aiEl.className = 'msg ai';
+  aiEl.innerHTML = '<span class="sys-action">[Routing Intent to MyHuman Network...]</span> Negotiating with swarm...';
+  chatBody.appendChild(aiEl);
   chatBody.scrollTop = chatBody.scrollHeight;
 
   try {
     const res = await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: USER_ID, message: message })
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({user_id: USER_ID, message: message})
     });
-    
     const data = await res.json();
-    
-    // Replace loading with real AI response
-    loadingBubble.innerHTML = `
-      <span class="sys-action">[DeepSeek Core Engine]</span>
-      ${data.reply}
-    `;
+    aiEl.innerHTML = `<span class="sys-action">[MuAI Intent Execution]</span>${data.reply}`;
 
-    // If DeepSeek returned a deal widget, render it dynamically
     if (data.action_widget) {
-      const widget = data.action_widget;
+      const w = data.action_widget;
       const widgetEl = document.createElement('div');
       widgetEl.className = 'chat-widget';
       widgetEl.innerHTML = `
-        <div class="cw-title"><svg class="icon"><use href="#i-handshake"/></svg> ${widget.title}</div>
-        <div class="cw-row"><span>Counterparty</span><span class="cw-val">${widget.counterparty}</span></div>
-        <div class="cw-row"><span>Price</span><span class="cw-val" style="color:var(--accent);">KES ${widget.price_kes}</span></div>
+        <div class="cw-title"><svg class="icon"><use href="#i-handshake"/></svg> ${w.title}</div>
+        <div class="cw-row"><span>Counterparty</span><span class="cw-val">${w.counterparty}</span></div>
+        <div class="cw-row"><span>Cleared Price</span><span class="cw-val" style="color:var(--accent);">KES ${w.display_price_kes} (Test: KES ${w.price_kes})</span></div>
         <div class="cw-btn-row">
-          <button class="cw-btn approve" onclick="executeSTKPush('${widget.deal_id}', ${widget.price_kes}, '${widget.title}')">Approve & Pay M-Pesa</button>
+          <button class="cw-btn approve" onclick="executeSTKPush('${w.deal_id}', ${w.price_kes}, '${w.title}')">Approve & Pay (KES ${w.price_kes})</button>
           <button class="cw-btn decline" onclick="this.parentElement.parentElement.remove()">Decline</button>
         </div>
       `;
       chatBody.appendChild(widgetEl);
     }
     chatBody.scrollTop = chatBody.scrollHeight;
+    refreshState();
+    loadFeed();
   } catch (err) {
-    loadingBubble.innerHTML = `<span class="sys-action" style="color:var(--danger)">[Error]</span> Failed to reach AI node.`;
+    aiEl.innerHTML = `<span class="sys-action" style="color:var(--danger)">[Error]</span> Failed to clear intent.`;
   }
 }
 
-// 3. Trigger Real M-Pesa STK Push from Browser
-async function executeSTKPush(dealId, amount, description) {
-  const phone = prompt("Enter Safaricom Phone Number for M-Pesa (format: 2547XXXXXXXX):", "2547");
+// 5. Trigger Real M-Pesa STK Push
+async function executeSTKPush(dealId, amount, desc) {
+  const phone = prompt("Enter Safaricom Number for M-Pesa STK Push (format: 2547XXXXXXXX):", "2547");
   if (!phone) return;
 
   const btn = event.target;
@@ -93,7 +138,7 @@ async function executeSTKPush(dealId, amount, description) {
   try {
     const res = await fetch(`${API_BASE}/api/payment/stk-push`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {"Content-Type": "application/json"},
       body: JSON.stringify({
         user_id: USER_ID,
         phone_number: phone,
@@ -102,60 +147,44 @@ async function executeSTKPush(dealId, amount, description) {
         deal_id: dealId
       })
     });
-
     const data = await res.json();
     if (data.status === "PENDING") {
-      btn.parentElement.innerHTML = `
-        <div class="cw-approved" style="background:rgba(0,229,255,0.1); border-color:var(--accent); color:var(--accent);">
-          📱 PIN Prompt Sent to ${phone}. Enter PIN...
-        </div>
-      `;
-      // Poll invoice status
-      pollInvoiceStatus(data.invoice_id);
+      btn.parentElement.innerHTML = `<div class="cw-approved">📱 PIN Prompt Sent to ${phone}. Enter PIN to confirm...</div>`;
+      pollStatus(data.invoice_id);
     } else {
-      alert("STK Push Failed: " + JSON.stringify(data));
-      btn.innerText = "Retry M-Pesa";
+      alert("STK failed: " + JSON.stringify(data));
+      btn.innerText = "Retry";
       btn.disabled = false;
     }
-  } catch (err) {
-    alert("Connection Error: " + err);
+  } catch (e) {
+    alert("Network error: " + e);
     btn.disabled = false;
   }
 }
 
-// 4. Poll invoice status until COMPLETE
-async function pollInvoiceStatus(invoiceId) {
-  let attempts = 0;
-  const interval = setInterval(async () => {
-    attempts++;
-    if (attempts > 30) clearInterval(interval); // 60s timeout
-
+// 6. Poll for Payment & Mint Aura
+function pollStatus(invoiceId) {
+  let count = 0;
+  const timer = setInterval(async () => {
+    count++;
+    if (count > 25) clearInterval(timer);
     try {
       const res = await fetch(`${API_BASE}/api/payment/check-status`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ invoice_id: invoiceId })
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({invoice_id: invoiceId})
       });
       const data = await res.json();
-      
       if (data.state === "COMPLETE") {
-        clearInterval(interval);
-        alert("🎉 M-Pesa Payment Confirmed! +15 Aura Minted to Ledger.");
+        clearInterval(timer);
+        alert("🎉 M-Pesa Payment Confirmed! +15 Aura Minted to your Sovereign Ledger.");
         refreshState();
-        
-        // Auto-open wormhole notification
-        const trayPill = document.querySelector('.ait-scroll');
-        if (trayPill) {
-          trayPill.innerHTML += `<span class="ait-pill" onclick="openWormhole('react')">⚡ Deal Active</span>`;
-        }
+        loadFeed();
       }
-    } catch (e) {
-      console.log("Polling...", e);
-    }
+    } catch (e) {}
   }, 2000);
 }
 
-// Attach Enter key listener to chat input
 document.addEventListener("DOMContentLoaded", () => {
   const input = document.querySelector('.chat-input-pill input');
   if (input) {
@@ -164,4 +193,5 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
   refreshState();
+  loadFeed();
 });
