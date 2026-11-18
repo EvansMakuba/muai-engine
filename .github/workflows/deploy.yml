@@ -17,7 +17,7 @@ jobs:
           host: ${{ secrets.VULTR_HOST }}
           username: ${{ secrets.VULTR_USER }}
           key: ${{ secrets.VULTR_SSH_KEY }}
-          source: "app/*,requirements.txt"
+          source: "app/*,app/templates/*,app/static/*,requirements.txt"
           target: "/opt/muai-engine"
 
       - name: Install dependencies & Restart Systemd Service

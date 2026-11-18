@@ -327,3 +327,6 @@ async def serve_app():
         return "<h1>MuAI Web Engine running. index.html loading...</h1>"
     with open(index_file, "r") as f:
         return HTMLResponse(content=f.read())
+
+# Mount static folder
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
