@@ -10,6 +10,7 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -20,6 +21,7 @@ load_dotenv(".env")
 
 app = FastAPI(title="MuAI Sovereign Epistemic Engine", version="1.0.0")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = "/opt/muai-engine/muai.db" if os.path.exists("/opt/muai-engine") else "muai.db"
 
 # ----------------- INTASEND & DEEPSEEK CONFIG -----------------
@@ -81,7 +83,6 @@ init_db()
 
 # ----------------- UTILITIES -----------------
 def clean_phone(phone: str) -> str:
-    """Formats phone to 2547XXXXXXXX or 2541XXXXXXXX as required by IntaSend"""
     p = phone.strip().replace("+", "").replace(" ", "")
     if p.startswith("0"):
         p = "254" + p[1:]
@@ -119,7 +120,7 @@ class STKPushRequest(BaseModel):
     user_id: str = "kevin"
     phone_number: str
     amount: float
-    purpose: str  # "ESCROW_LOCK" or "COMPUTE_TOPUP"
+    purpose: str
     deal_id: Optional[str] = "deal-001"
 
 class StatusCheckRequest(BaseModel):
@@ -145,7 +146,7 @@ async def get_state(user_id: str):
         raise HTTPException(status_code=404, detail="User not found")
     return dict(row)
 
-# 1. TRIGGER M-PESA STK PUSH (Both Escrow & Subscriptions)
+# 1. TRIGGER M-PESA STK PUSH
 @app.post("/api/payment/stk-push")
 async def trigger_stk_push(req: STKPushRequest):
     if not INTASEND_SECRET_KEY:
@@ -187,7 +188,7 @@ async def trigger_stk_push(req: STKPushRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Transport failure: {str(e)}")
 
-# 2. INTASEND STATUS CHECK (Polling Fallback)
+# 2. INTASEND STATUS CHECK
 @app.post("/api/payment/check-status")
 async def check_status(req: StatusCheckRequest):
     headers = {
@@ -213,7 +214,7 @@ async def check_status(req: StatusCheckRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-# 3. LIVE WEBHOOK HANDLER (With Challenge & Idempotency)
+# 3. LIVE WEBHOOK HANDLER
 @app.post("/api/webhooks/intasend")
 async def intasend_webhook(request: Request):
     try:
@@ -221,12 +222,10 @@ async def intasend_webhook(request: Request):
     except Exception:
         return Response(status_code=400, content="Invalid JSON")
 
-    # A. Verify Challenge
     incoming_challenge = str(body.get("challenge", ""))
     if not hmac.compare_digest(incoming_challenge, INTASEND_CHALLENGE):
         return Response(status_code=401, content="Invalid Webhook Challenge")
 
-    # B. Filter Collection Event
     topic = body.get("topic")
     state = body.get("state")
     invoice_id = body.get("invoice_id")
@@ -240,13 +239,12 @@ async def intasend_webhook(request: Request):
     return Response(status_code=200, content="OK")
 
 async def fulfill_payment(invoice_id: str, api_ref: str, amount: float):
-    """Idempotently commits payment and mints Aura"""
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT invoice_id FROM processed_invoices WHERE invoice_id = ?", (invoice_id,))
     if cursor.fetchone():
         conn.close()
-        return  # Already fulfilled
+        return
 
     cursor.execute("""
     INSERT INTO processed_invoices (invoice_id, state, amount, api_ref, updated_at)
@@ -255,16 +253,13 @@ async def fulfill_payment(invoice_id: str, api_ref: str, amount: float):
     conn.commit()
     conn.close()
 
-    # Parse api_ref: e.g. "ESCROW_LOCK:kevin:deal-001" or "COMPUTE_TOPUP:kevin:50000"
     parts = api_ref.split(":") if api_ref else []
     purpose = parts[0] if len(parts) > 0 else "UNKNOWN"
     user_id = parts[1] if len(parts) > 1 else "kevin"
 
     if purpose == "ESCROW_LOCK":
-        # Commit Escrow and award +15 Aura for contract fulfillment
         commit_ledger_entry(user_id, f"Escrow Funded (Invoice {invoice_id})", 15.0, amount)
     elif purpose == "COMPUTE_TOPUP":
-        # Add credits (e.g., 50,000 tokens)
         conn = get_db()
         conn.cursor().execute("UPDATE users SET compute_credits = compute_credits + 50000 WHERE id = ?", (user_id,))
         conn.commit()
@@ -293,7 +288,6 @@ async def chat(req: ChatRequest):
         )
         ai_reply = response.choices[0].message.content
 
-        # Interactive Widget Generator
         action_widget = None
         lower_msg = req.message.lower()
         if "calculator" in lower_msg or "casio" in lower_msg:
@@ -301,7 +295,7 @@ async def chat(req: ChatRequest):
                 "type": "SPNE_DEAL",
                 "title": "🤝 Deal Cleared: Casio fx-82MS",
                 "counterparty": "Student X (Hostel H • Aura: 4,500)",
-                "price_kes": 10.0,  # Set to 10 KES for live demo testing
+                "price_kes": 10.0,
                 "action": "LOCK_ESCROW",
                 "deal_id": "calc-88"
             }
@@ -319,14 +313,15 @@ async def chat(req: ChatRequest):
     except Exception as e:
         return {"reply": f"DeepSeek Engine Notice: {str(e)}", "action_widget": None}
 
-# 5. SERVE FRONTEND AT ROOT
+# 5. STATIC FILES & SERVE FRONTEND
+static_dir = os.path.join(BASE_DIR, "static")
+if os.path.exists(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_app():
-    index_file = "app/templates/index.html"
+    index_file = os.path.join(BASE_DIR, "templates", "index.html")
     if not os.path.exists(index_file):
-        return "<h1>MuAI Web Engine running. index.html loading...</h1>"
+        return HTMLResponse("<h1>MuAI Web Engine running. index.html loading...</h1>")
     with open(index_file, "r") as f:
         return HTMLResponse(content=f.read())
-
-# Mount static folder
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
