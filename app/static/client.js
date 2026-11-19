@@ -2,6 +2,8 @@ const API_BASE = window.location.origin;
 let authToken = localStorage.getItem("muai_token");
 let currentUser = null;
 let activeWormholeId = null;
+let pendingMpesaTx = null;
+let activePollTimer = null;
 
 function authHeaders(extra = {}) {
   return { ...extra, "Authorization": `Bearer ${authToken}` };
@@ -50,8 +52,8 @@ async function initGoogleSignIn() {
 }
 
 async function loginDemo() {
-  const pin = prompt("Enter Stage Presenter PIN:", "");
-  if (!pin) return;
+  const pin = document.getElementById("demo-pin-input")?.value.trim() || "";
+  if (!pin) return alert("Enter your Stage PIN.");
   const res = await fetch(`${API_BASE}/api/auth/demo`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -104,7 +106,8 @@ async function refreshMe() {
     document.getElementById("prof-aura").innerText = currentUser.aura;
     document.getElementById("prof-battery").innerText = `${currentUser.battery}%`;
     document.getElementById("prof-credits").innerText = currentUser.compute_credits;
-    document.getElementById("prof-kes").innerText = currentUser.escrow_kes.toLocaleString();
+    document.getElementById("prof-wallet").innerText = (currentUser.wallet_kes ?? 0).toLocaleString();
+    document.getElementById("prof-locked").innerText = (currentUser.locked_escrow_kes ?? 0).toLocaleString();
 
     if (currentUser.is_verified_student) {
       document.getElementById("verified-badge").classList.remove("hidden");
@@ -120,7 +123,6 @@ async function refreshMe() {
       document.getElementById("user-initials").innerText = initials;
     }
 
-    // Active Wormholes
     const whContainer = document.getElementById("sidebar-wormholes");
     const whList = data.wormholes || [];
     document.getElementById("wh-count").innerText = whList.length;
@@ -138,7 +140,6 @@ async function refreshMe() {
       whContainer.innerHTML = `<p class="text-xs text-slate-600 px-2 py-2">No active escrows. Claim a task or lock a deal to spawn an E2EE Wormhole.</p>`;
     }
 
-    // Ledger History
     const ledgerEl = document.getElementById("ledger-list");
     ledgerEl.innerHTML = (data.ledger || []).map(item => `
       <div class="py-3 flex items-center justify-between gap-4">
@@ -148,7 +149,7 @@ async function refreshMe() {
         </div>
         <div class="text-right shrink-0 font-mono font-bold">
           ${item.amount_aura ? `<div class="${item.amount_aura > 0 ? 'text-amber-400' : 'text-rose-400'}">${item.amount_aura > 0 ? '+' : ''}${item.amount_aura} Aura</div>` : ''}
-          ${item.amount_kes ? `<div class="text-emerald-400 text-xs">KES ${item.amount_kes}</div>` : ''}
+          ${item.amount_kes ? `<div class="${item.amount_kes > 0 ? 'text-emerald-400' : 'text-slate-400'} text-xs">${item.amount_kes > 0 ? '+' : ''}KES ${item.amount_kes}</div>` : ''}
         </div>
       </div>
     `).join("") || `<p class="text-slate-500 py-4 text-sm">No ledger transactions yet.</p>`;
@@ -158,13 +159,12 @@ async function refreshMe() {
   }
 }
 
-// ---------------- BILLING ALLOCATION ----------------
+// ---------------- BILLING ALLOCATION & WALLET ESCROW ----------------
 async function allocateEscrowToCompute() {
   const input = document.getElementById("alloc-kes-input");
   const amount = parseFloat(input.value || "0");
-  if (isNaN(amount) || amount < 10) {
-    return alert("Minimum allocation is KES 10.");
-  }
+  if (isNaN(amount) || amount < 10) return alert("Minimum allocation is KES 10.");
+
   const res = await fetch(`${API_BASE}/api/billing/allocate`, {
     method: "POST",
     headers: authHeaders({ "Content-Type": "application/json" }),
@@ -172,10 +172,37 @@ async function allocateEscrowToCompute() {
   });
   const data = await res.json();
   if (res.ok) {
+    await refreshMe();
     alert(`✓ Allocated KES ${amount} -> +${data.credits_added} AI Compute Credits!`);
-    refreshMe();
   } else {
     alert(data.detail || "Allocation failed.");
+  }
+}
+
+async function payFromWallet(dealId, amount, title, counterparty, btnEl) {
+  const orig = btnEl.innerHTML;
+  btnEl.innerText = "Locking...";
+  btnEl.disabled = true;
+  try {
+    const res = await fetch(`${API_BASE}/api/escrow/pay-from-wallet`, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ amount_kes: amount, deal_id: dealId, title: title, counterparty: counterparty })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      btnEl.parentElement.innerHTML = `<div class="text-xs text-emerald-400 font-bold py-2">✓ Locked KES ${amount} from Wallet (+15 Aura)</div>`;
+      await refreshMe();
+      if (data.wormhole_id) openWormhole(data.wormhole_id);
+    } else {
+      alert(data.detail || "Wallet payment failed.");
+      btnEl.innerHTML = orig;
+      btnEl.disabled = false;
+    }
+  } catch (e) {
+    alert("Error: " + e);
+    btnEl.innerHTML = orig;
+    btnEl.disabled = false;
   }
 }
 
@@ -197,7 +224,7 @@ function switchTab(tabName) {
   if (tabName === "profile") refreshMe();
 }
 
-// ---------------- PERSISTENT CHAT HISTORY & MISSION CONTROL ----------------
+// ---------------- CHAT ----------------
 function renderMissionControlCard() {
   return `
     <div class="bg-[#131620] border border-white/10 rounded-2xl p-5">
@@ -227,9 +254,7 @@ async function loadChatHistory() {
       box.innerHTML += `<div class="flex justify-start"><div class="max-w-2xl bg-[#12141c] border-l-2 border-cyan-400 rounded-2xl rounded-bl-sm px-4 py-3 text-sm text-slate-200 leading-relaxed">${formatMarkdown(turn.ai_reply)}</div></div>`;
     });
     box.scrollTop = box.scrollHeight;
-  } catch (e) {
-    console.error("Chat history load error:", e);
-  }
+  } catch (e) {}
 }
 
 function sendQuickPrompt(text) {
@@ -271,26 +296,30 @@ async function sendChat() {
     let widgetHtml = "";
     if (data.action_widget) {
       const w = data.action_widget;
+      const safeTitle = (w.title || "").replace(/'/g, "");
+      const safeCounterparty = (w.counterparty || "").replace(/'/g, "");
       if (w.type === "COMPUTE_TOPUP") {
         widgetHtml = `
           <div class="mt-4 bg-[#181c28] border border-amber-400/40 rounded-xl p-4">
             <div class="font-display font-bold text-amber-300 text-sm mb-2">⚡ ${w.title}</div>
             <div class="flex flex-wrap gap-2 mt-2">
-              <button onclick="executeSTKPush('topup-20', 20, '2k Compute Credits', this, 'COMPUTE_TOPUP')" class="flex-1 py-2 px-3 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs cursor-pointer">KES 20 (2k)</button>
-              <button onclick="executeSTKPush('topup-50', 50, '5k Compute Credits', this, 'COMPUTE_TOPUP')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">KES 50 (5k)</button>
-              <button onclick="switchTab('profile')" class="px-3 py-2 rounded-lg border border-white/15 text-xs text-slate-200 cursor-pointer">Billing / Allocate</button>
+              <button onclick="openMpesaModal('topup-20', 20, '2,000 Compute Credits', 'COMPUTE_TOPUP')" class="flex-1 py-2 px-3 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs cursor-pointer">M-Pesa KES 20</button>
+              <button onclick="openMpesaModal('topup-50', 50, '5,000 Compute Credits', 'COMPUTE_TOPUP')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">M-Pesa KES 50</button>
+              <button onclick="switchTab('profile')" class="px-3 py-2 rounded-lg border border-white/15 text-xs text-slate-200 cursor-pointer">Allocate Wallet</button>
             </div>
           </div>
         `;
       } else if (w.type === "SPNE_DEAL") {
+        const hasWallet = currentUser && (currentUser.wallet_kes >= w.price_kes);
         widgetHtml = `
           <div class="mt-4 bg-[#181c28] border border-cyan-400/40 rounded-xl p-4">
             <div class="font-display font-bold text-cyan-300 text-sm mb-2">🤝 ${w.title}</div>
             <div class="text-xs text-slate-400 flex justify-between mb-1"><span>Counterparty</span><span class="text-white font-medium">${w.counterparty}</span></div>
             <div class="text-xs text-slate-400 flex justify-between mb-3"><span>SPNE Price</span><span class="text-emerald-400 font-bold">KES ${w.display_price_kes} (Demo: KES ${w.price_kes})</span></div>
-            <div class="flex gap-2">
-              <button onclick="executeSTKPush('${w.deal_id}', ${w.price_kes}, '${w.title.replace(/'/g, '')}', this, 'ESCROW_LOCK')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">
-                Approve &amp; Pay M-Pesa (KES ${w.price_kes})
+            <div class="flex flex-wrap gap-2">
+              ${hasWallet ? `<button onclick="payFromWallet('${w.deal_id}', ${w.price_kes}, '${safeTitle}', '${safeCounterparty}', this)" class="flex-1 py-2 px-3 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-bold text-xs cursor-pointer">Lock from Wallet (KES ${w.price_kes})</button>` : ''}
+              <button onclick="openMpesaModal('${w.deal_id}', ${w.price_kes}, '${safeTitle}', 'ESCROW_LOCK')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">
+                Pay via M-Pesa (KES ${w.price_kes})
               </button>
               <button onclick="this.closest('.mt-4').remove()" class="px-3 py-2 rounded-lg border border-white/15 text-xs text-slate-300 cursor-pointer">Decline</button>
             </div>
@@ -413,9 +442,7 @@ async function loadFeed(category = "all", btnEl = null) {
         <div class="text-xs text-cyan-400 font-medium">${p.comments_count} Agent Bids &rarr;</div>
       </div>
     `).join("") || `<p class="p-6 text-sm text-slate-500">No broadcasts in this community yet.</p>`;
-  } catch (e) {
-    console.error("Feed error:", e);
-  }
+  } catch (e) {}
 }
 
 async function openThread(postId) {
@@ -504,17 +531,35 @@ async function loadLeaderboard() {
         <div class="text-xs text-slate-400 mt-1">Seeded by ${d.uploader_name}</div>
       </div>
     `).join("") || `<p class="text-xs text-slate-500">No academic documents seeded yet.</p>`;
-  } catch (e) {
-    console.error("Leaderboard error:", e);
-  }
+  } catch (e) {}
 }
 
-// ---------------- M-PESA STK PUSH & WORMHOLES ----------------
-async function executeSTKPush(dealId, amount, title, btnEl = null, purpose = "ESCROW_LOCK") {
-  const phone = prompt(`Enter Safaricom Phone Number for KES ${amount} M-Pesa STK Push (e.g. 2547XXXXXXXX):`, "2547");
-  if (!phone) return;
-  const origText = btnEl ? btnEl.innerHTML : "";
-  if (btnEl) { btnEl.innerText = "Sending STK..."; btnEl.disabled = true; }
+// ---------------- IN-APP M-PESA MODAL & SMART POLLING ----------------
+function openMpesaModal(dealId, amount, title, purpose = "ESCROW_LOCK") {
+  pendingMpesaTx = { dealId, amount, title, purpose };
+  document.getElementById("mpesa-modal-subtitle").innerText = title;
+  document.getElementById("mpesa-modal-amount").innerText = `KES ${amount}`;
+  document.getElementById("mpesa-phone-input").value = (currentUser && currentUser.phone) ? currentUser.phone : "2547";
+  document.getElementById("mpesa-form-area").classList.remove("hidden");
+  document.getElementById("mpesa-status-box").classList.add("hidden");
+  document.getElementById("mpesa-send-btn").disabled = false;
+  document.getElementById("mpesa-send-btn").innerText = "Send M-Pesa STK Prompt";
+  document.getElementById("mpesa-modal").classList.remove("hidden");
+}
+
+function closeMpesaModal() {
+  if (activePollTimer) clearInterval(activePollTimer);
+  document.getElementById("mpesa-modal").classList.add("hidden");
+}
+
+async function submitMpesaModal() {
+  if (!pendingMpesaTx) return;
+  const phone = document.getElementById("mpesa-phone-input").value.trim();
+  if (phone.length < 9) return alert("Enter a valid Safaricom number.");
+
+  const btn = document.getElementById("mpesa-send-btn");
+  btn.disabled = true;
+  btn.innerText = "Dispatching STK Push...";
 
   try {
     const res = await fetch(`${API_BASE}/api/payment/stk-push`, {
@@ -522,33 +567,44 @@ async function executeSTKPush(dealId, amount, title, btnEl = null, purpose = "ES
       headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         phone_number: phone,
-        amount: amount,
-        purpose: purpose,
-        deal_id: dealId,
-        title: title
+        amount: pendingMpesaTx.amount,
+        purpose: pendingMpesaTx.purpose,
+        deal_id: pendingMpesaTx.dealId,
+        title: pendingMpesaTx.title
       })
     });
     const data = await res.json();
     if (data.status === "PENDING" && data.invoice_id) {
-      if (btnEl) btnEl.innerHTML = `📱 Enter PIN on ${phone}...`;
-      pollInvoice(data.invoice_id, purpose, btnEl, origText);
+      document.getElementById("mpesa-form-area").classList.add("hidden");
+      const statusBox = document.getElementById("mpesa-status-box");
+      statusBox.className = "rounded-xl p-4 text-sm border border-cyan-500/40 bg-cyan-500/10 text-cyan-200";
+      statusBox.innerHTML = `📱 <strong>PIN Prompt sent to ${phone}</strong>.<br><span class="text-xs text-slate-300">Enter your M-Pesa PIN. Waiting for Safaricom confirmation...</span>`;
+      statusBox.classList.remove("hidden");
+      pollInvoiceModal(data.invoice_id, pendingMpesaTx.purpose);
     } else {
-      alert("STK Push Error: " + JSON.stringify(data));
-      if (btnEl) { btnEl.innerHTML = origText; btnEl.disabled = false; }
+      alert("STK Error: " + JSON.stringify(data));
+      btn.disabled = false;
+      btn.innerText = "Send M-Pesa STK Prompt";
     }
   } catch (e) {
     alert("Payment request failed: " + e);
-    if (btnEl) { btnEl.innerHTML = origText; btnEl.disabled = false; }
+    btn.disabled = false;
+    btn.innerText = "Send M-Pesa STK Prompt";
   }
 }
 
-function pollInvoice(invoiceId, purpose, btnEl = null, origText = "") {
+function pollInvoiceModal(invoiceId, purpose) {
   let tries = 0;
-  const timer = setInterval(async () => {
+  if (activePollTimer) clearInterval(activePollTimer);
+  const statusBox = document.getElementById("mpesa-status-box");
+
+  activePollTimer = setInterval(async () => {
     tries++;
-    if (tries > 30) {
-      clearInterval(timer);
-      if (btnEl) { btnEl.innerHTML = origText; btnEl.disabled = false; }
+    if (tries > 90) { // 3 minutes max
+      clearInterval(activePollTimer);
+      statusBox.className = "rounded-xl p-4 text-sm border border-amber-500/40 bg-amber-500/10 text-amber-200";
+      statusBox.innerText = "⏳ Still awaiting Safaricom callback. If you already paid, your wallet/Wormhole will update automatically via webhook.";
+      return;
     }
     try {
       const res = await fetch(`${API_BASE}/api/payment/check-status`, {
@@ -557,21 +613,28 @@ function pollInvoice(invoiceId, purpose, btnEl = null, origText = "") {
         body: JSON.stringify({ invoice_id: invoiceId })
       });
       const data = await res.json();
+
       if (data.state === "COMPLETE") {
-        clearInterval(timer);
-        if (btnEl) { btnEl.innerHTML = origText; btnEl.disabled = false; }
+        clearInterval(activePollTimer);
         await refreshMe();
+        statusBox.className = "rounded-xl p-4 text-sm border border-emerald-500/40 bg-emerald-500/10 text-emerald-200";
         if (purpose === "COMPUTE_TOPUP") {
-          alert("⚡ M-Pesa Confirmed! Compute Credits added to your MuAI node.");
+          statusBox.innerHTML = `✅ <strong>Confirmed!</strong> Compute Credits added to your node.<br><button onclick="closeMpesaModal()" class="mt-3 w-full py-2 rounded-lg bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer">Done</button>`;
+        } else if (purpose === "WALLET_DEPOSIT") {
+          statusBox.innerHTML = `✅ <strong>Deposit Confirmed!</strong> +10 Aura Minted &amp; Available Wallet updated.<br><button onclick="closeMpesaModal()" class="mt-3 w-full py-2 rounded-lg bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer">Done</button>`;
         } else {
-          alert("🎉 M-Pesa Confirmed! +15 Aura minted and E2EE Wormhole spawned.");
-          if (data.wormhole_id) openWormhole(data.wormhole_id);
+          statusBox.innerHTML = `✅ <strong>Escrow Locked!</strong> +15 Aura Minted &amp; E2EE Wormhole spawned.<br><button onclick="closeMpesaModal(); ${data.wormhole_id ? `openWormhole('${data.wormhole_id}')` : ''}" class="mt-3 w-full py-2 rounded-lg bg-cyan-400 text-slate-950 font-bold text-xs cursor-pointer">Enter E2EE Wormhole &rarr;</button>`;
         }
+      } else if (data.state === "FAILED" || data.state === "CANCELED") {
+        clearInterval(activePollTimer);
+        statusBox.className = "rounded-xl p-4 text-sm border border-rose-500/40 bg-rose-500/10 text-rose-200";
+        statusBox.innerHTML = `❌ <strong>Payment ${data.state}:</strong> ${data.failed_reason || "Cancelled on phone."}`;
       }
     } catch (e) {}
   }, 2000);
 }
 
+// ---------------- WORMHOLES ----------------
 function openLatestWormhole() {
   if (window._latestWhId) openWormhole(window._latestWhId);
 }
