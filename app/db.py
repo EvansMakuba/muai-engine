@@ -23,26 +23,36 @@ def init_pg_db():
     with conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-        # 1. Multi-User Sovereign Nodes (100 trial credits = ~2 turns)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
             email TEXT UNIQUE,
             name TEXT NOT NULL,
+            phone TEXT,
             picture TEXT,
             is_verified_student BOOLEAN DEFAULT FALSE,
             campus TEXT DEFAULT 'Moi University',
             aura INTEGER DEFAULT 100,
             battery INTEGER DEFAULT 85,
+            wallet_kes NUMERIC(12, 2) DEFAULT 0.00,
+            locked_escrow_kes NUMERIC(12, 2) DEFAULT 0.00,
             escrow_kes NUMERIC(12, 2) DEFAULT 0.00,
             compute_credits INTEGER DEFAULT 100,
             persona_vector JSONB DEFAULT '{"O":0.5,"C":0.7,"E":0.5,"A":0.6,"R":0.4}'::jsonb,
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
         """)
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_kes NUMERIC(12, 2) DEFAULT 0.00;")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_escrow_kes NUMERIC(12, 2) DEFAULT 0.00;")
         cur.execute("ALTER TABLE users ALTER COLUMN compute_credits SET DEFAULT 100;")
 
-        # 2. Seeding Challenge: Academic Papers & Notes
+        # Migrate legacy escrow_kes into wallet_kes once if wallet_kes is still 0
+        cur.execute("""
+        UPDATE users SET wallet_kes = escrow_kes
+        WHERE wallet_kes = 0 AND escrow_kes > 0;
+        """)
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id TEXT PRIMARY KEY,
@@ -58,7 +68,6 @@ def init_pg_db():
         );
         """)
 
-        # 3. pgvector Academic Chunks
         cur.execute("""
         CREATE TABLE IF NOT EXISTS document_chunks (
             id SERIAL PRIMARY KEY,
@@ -74,7 +83,6 @@ def init_pg_db():
         ON document_chunks USING hnsw (embedding vector_cosine_ops);
         """)
 
-        # 4. O(1) Constant-Token Episodic User Memory
         cur.execute("""
         CREATE TABLE IF NOT EXISTS user_memories (
             id SERIAL PRIMARY KEY,
@@ -89,7 +97,6 @@ def init_pg_db():
         ON user_memories USING hnsw (embedding vector_cosine_ops);
         """)
 
-        # 5. Full Chat Audit Logs (Observability + Anti-Abuse)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS chat_logs (
             id SERIAL PRIMARY KEY,
@@ -101,7 +108,6 @@ def init_pg_db():
         );
         """)
 
-        # 6. MyHuman Agent Network Feed & Negotiation Threads
         cur.execute("""
         CREATE TABLE IF NOT EXISTS posts (
             id TEXT PRIMARY KEY,
@@ -128,7 +134,6 @@ def init_pg_db():
         );
         """)
 
-        # 7. Hash-Chained Immutable Ledger
         cur.execute("""
         CREATE TABLE IF NOT EXISTS ledger (
             id SERIAL PRIMARY KEY,
@@ -142,7 +147,6 @@ def init_pg_db():
         );
         """)
 
-        # 8. IntaSend Idempotency Registry
         cur.execute("""
         CREATE TABLE IF NOT EXISTS processed_invoices (
             invoice_id TEXT PRIMARY KEY,
@@ -153,7 +157,6 @@ def init_pg_db():
         );
         """)
 
-        # 9. ADK 2.0 JSONB Session Storage
         cur.execute("""
         CREATE TABLE IF NOT EXISTS adk_sessions (
             session_id TEXT PRIMARY KEY,
@@ -165,32 +168,35 @@ def init_pg_db():
         """)
 
         cur.execute("""
-        INSERT INTO users (id, email, name, is_verified_student, aura, battery, escrow_kes, compute_credits)
-        VALUES ('kevin', 'kevin@students.mu.ac.ke', 'Kevin M.', TRUE, 4310, 85, 3850.00, 5000)
+        INSERT INTO users (id, email, name, is_verified_student, aura, battery, wallet_kes, locked_escrow_kes, escrow_kes, compute_credits)
+        VALUES ('kevin', 'kevin@students.mu.ac.ke', 'Kevin M.', TRUE, 4310, 85, 3850.00, 0.00, 3850.00, 5000)
         ON CONFLICT (id) DO NOTHING;
         """)
 
     conn.commit()
     conn.close()
 
-def commit_ledger(user_id: str, action: str, aura: float, kes: float) -> str:
+def commit_ledger(user_id: str, action: str, aura: float, wallet_delta: float = 0.0, escrow_delta: float = 0.0) -> str:
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT hash FROM ledger ORDER BY id DESC LIMIT 1;")
         row = cur.fetchone()
         prev = row["hash"] if row else "0" * 64
         ts = datetime.now(timezone.utc).isoformat()
-        raw = f"{prev}|{user_id}|{action}|{aura}|{kes}|{ts}"
+        total_kes_event = wallet_delta if wallet_delta != 0 else escrow_delta
+        raw = f"{prev}|{user_id}|{action}|{aura}|{total_kes_event}|{ts}"
         new_h = hashlib.sha256(raw.encode()).hexdigest()
 
         cur.execute(
             "INSERT INTO ledger (user_id, action, amount_aura, amount_kes, prev_hash, hash, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s);",
-            (user_id, action, aura, kes, prev, new_h, ts)
+            (user_id, action, aura, total_kes_event, prev, new_h, ts)
         )
         if aura != 0:
             cur.execute("UPDATE users SET aura = aura + %s WHERE id = %s;", (int(aura), user_id))
-        if kes != 0:
-            cur.execute("UPDATE users SET escrow_kes = escrow_kes + %s WHERE id = %s;", (kes, user_id))
+        if wallet_delta != 0:
+            cur.execute("UPDATE users SET wallet_kes = wallet_kes + %s, escrow_kes = escrow_kes + %s WHERE id = %s;", (wallet_delta, wallet_delta, user_id))
+        if escrow_delta != 0:
+            cur.execute("UPDATE users SET locked_escrow_kes = GREATEST(0, locked_escrow_kes + %s) WHERE id = %s;", (escrow_delta, user_id))
     conn.commit()
     conn.close()
     return new_h
