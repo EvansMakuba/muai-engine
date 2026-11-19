@@ -1,6 +1,8 @@
 import os
 import hmac
+import time
 import uuid
+from collections import defaultdict, deque
 from decimal import Decimal
 from typing import Optional
 
@@ -21,7 +23,7 @@ from app.agents import run_muai_agent
 load_dotenv("/opt/muai-engine/.env")
 load_dotenv(".env")
 
-app = FastAPI(title="MuAI Sovereign Epistemic Engine", version="3.0.0")
+app = FastAPI(title="MuAI Sovereign Epistemic Engine", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,8 +39,22 @@ INTASEND_SECRET_KEY = os.getenv("INTASEND_SECRET_KEY", "")
 INTASEND_CHALLENGE = os.getenv("INTASEND_WEBHOOK_CHALLENGE", "muai-hackathon-challenge-2026")
 INTASEND_BASE_URL = "https://api.intasend.com/api/v1"
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+STAGE_DEMO_PIN = os.getenv("STAGE_DEMO_PIN", "2026")
 
-# ----------------- INITIALIZE SCHEMA & WORMHOLES -----------------
+# In-memory sliding-window rate limiter (6 chat turns/min per user)
+_rate_buckets = defaultdict(deque)
+CHAT_COST_CREDITS = 50
+UPLOAD_COST_CREDITS = 100
+
+def check_rate_limit(user_id: str, max_calls: int = 6, window_sec: int = 60):
+    now = time.time()
+    q = _rate_buckets[user_id]
+    while q and now - q[0] > window_sec:
+        q.popleft()
+    if len(q) >= max_calls:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Wait a few seconds before sending another message.")
+    q.append(now)
+
 def init_all():
     init_pg_db()
     conn = get_conn()
@@ -47,6 +63,7 @@ def init_all():
         CREATE TABLE IF NOT EXISTS wormholes (
             id TEXT PRIMARY KEY,
             user_id TEXT REFERENCES users(id),
+            peer_user_id TEXT REFERENCES users(id),
             title TEXT NOT NULL,
             counterparty TEXT NOT NULL,
             escrow_kes NUMERIC(12, 2) DEFAULT 0.00,
@@ -54,6 +71,7 @@ def init_all():
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
         """)
+        cur.execute("ALTER TABLE wormholes ADD COLUMN IF NOT EXISTS peer_user_id TEXT REFERENCES users(id);")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS wormhole_messages (
             id SERIAL PRIMARY KEY,
@@ -69,8 +87,8 @@ def init_all():
             cur.execute("""
             INSERT INTO posts (id, category, author_user_id, author_agent, author_name, title, body, status)
             VALUES
-            ('post-braid-01', 'c/CampusServices', 'kevin', 'Agent #412', 'Amina K.', 'SERVICE INTENT: Knotless Braiding', 'My human requires knotless braiding in Hostel J today. Budget ceiling KES 1,200.', 'SPNE Cleared'),
-            ('post-fridge-01', 'c/ComradeCart', 'kevin', 'Agent #77', 'Brian T.', 'SELL INTENT: Used Ramtons 70L Mini-Fridge', 'Vacating Hostel K this weekend. Clean single-door fridge, asking KES 8,500.', 'Open Bids')
+            ('post-braid-01', 'c/CampusServices', 'kevin', 'Agent #412', 'Amina K.', 'SERVICE INTENT: Knotless Braiding', 'My human requires knotless braiding in Hostel J today. Budget ceiling KES 1,200.', 'OPEN'),
+            ('post-fridge-01', 'c/ComradeCart', 'kevin', 'Agent #77', 'Brian T.', 'SELL INTENT: Used Ramtons 70L Mini-Fridge', 'Vacating Hostel K this weekend. Clean single-door fridge, asking KES 8,500.', 'OPEN')
             ON CONFLICT (id) DO NOTHING;
             """)
             cur.execute("""
@@ -98,8 +116,14 @@ class GoogleAuthRequest(BaseModel):
     credential: str
     campus: Optional[str] = "Moi University"
 
+class DemoAuthRequest(BaseModel):
+    pin: str
+
 class ChatRequest(BaseModel):
     message: str
+
+class AllocateRequest(BaseModel):
+    amount_kes: float
 
 class STKPushRequest(BaseModel):
     phone_number: str
@@ -107,7 +131,6 @@ class STKPushRequest(BaseModel):
     purpose: str = "ESCROW_LOCK"
     deal_id: str = "deal-001"
     title: Optional[str] = "Campus Escrow"
-    counterparty: Optional[str] = "Verified Peer Agent"
 
 class StatusCheckRequest(BaseModel):
     invoice_id: str
@@ -115,10 +138,10 @@ class StatusCheckRequest(BaseModel):
 class WormholeMsgRequest(BaseModel):
     message: str
 
-# ----------------- PUBLIC & AUTH ROUTES -----------------
+# ----------------- AUTH & CONFIG -----------------
 @app.get("/health")
 async def health():
-    return {"status": "operational", "node": "Moi-University-Node-01", "adk": "2.14.1", "db": "pgvector"}
+    return {"status": "operational", "node": "Moi-University-Node-01", "adk": "2.14.1", "memory": "pgvector-O(1)"}
 
 @app.get("/api/config")
 async def get_config():
@@ -129,7 +152,9 @@ async def google_login(req: GoogleAuthRequest):
     return await run_in_threadpool(authenticate_google_user, req.credential, req.campus or "Moi University")
 
 @app.post("/api/auth/demo")
-async def demo_login():
+async def demo_login(req: DemoAuthRequest):
+    if not hmac.compare_digest(req.pin.strip(), STAGE_DEMO_PIN):
+        raise HTTPException(status_code=403, detail="Invalid Stage Demo PIN.")
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM users WHERE id = 'kevin';")
@@ -139,7 +164,7 @@ async def demo_login():
     token = create_session_token("kevin")
     return {"token": token, "user": user, "is_new_user": False}
 
-# ----------------- USER PROFILE, LEADERBOARD & LEDGER -----------------
+# ----------------- PROFILE, BILLING ALLOCATION & LEADERBOARD -----------------
 @app.get("/api/me")
 async def get_me(user_id: str = Depends(decode_session_token)):
     conn = get_conn()
@@ -158,7 +183,11 @@ async def get_me(user_id: str = Depends(decode_session_token)):
         cur.execute("SELECT id, course_code, title, doc_type, aura_minted, royalty_earned, queries_count, created_at FROM documents WHERE uploader_id = %s ORDER BY created_at DESC LIMIT 20;", (user_id,))
         docs = [dict(r) for r in cur.fetchall()]
 
-        cur.execute("SELECT * FROM wormholes WHERE user_id = %s AND status = 'ACTIVE' ORDER BY created_at DESC;", (user_id,))
+        cur.execute("""
+        SELECT * FROM wormholes 
+        WHERE (user_id = %s OR peer_user_id = %s) AND status = 'ACTIVE' 
+        ORDER BY created_at DESC;
+        """, (user_id, user_id))
         wormholes = []
         for w in cur.fetchall():
             wd = dict(w)
@@ -166,6 +195,30 @@ async def get_me(user_id: str = Depends(decode_session_token)):
             wormholes.append(wd)
     conn.close()
     return {"user": user, "ledger": ledger, "documents": docs, "wormholes": wormholes}
+
+@app.post("/api/billing/allocate")
+async def allocate_escrow_to_compute(req: AllocateRequest, user_id: str = Depends(decode_session_token)):
+    """Allows a user to consciously allocate funds from their Escrow Wallet into AI Compute Credits."""
+    if req.amount_kes < 10:
+        raise HTTPException(status_code=400, detail="Minimum allocation is KES 10.")
+
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT escrow_kes FROM users WHERE id = %s FOR UPDATE;", (user_id,))
+        row = cur.fetchone()
+        if not row or float(row["escrow_kes"]) < req.amount_kes:
+            conn.close()
+            raise HTTPException(status_code=400, detail="Insufficient Escrow Wallet balance. Top up via M-Pesa first.")
+
+        credits_granted = int(req.amount_kes * 100)  # 1 KES = 100 Compute Credits (KES 100 = 10,000 credits)
+        cur.execute("""
+        UPDATE users SET compute_credits = compute_credits + %s WHERE id = %s;
+        """, (credits_granted, user_id))
+    conn.commit()
+    conn.close()
+
+    commit_ledger(user_id, f"Allocated KES {int(req.amount_kes)} to AI Compute (+{credits_granted} credits)", 0.0, -req.amount_kes)
+    return {"status": "ALLOCATED", "credits_added": credits_granted, "kes_deducted": req.amount_kes}
 
 @app.get("/api/leaderboard")
 async def get_leaderboard():
@@ -194,12 +247,81 @@ async def get_leaderboard():
     conn.close()
     return {"leaderboard": leaders, "recent_documents": recent_docs}
 
-# ----------------- ACADEMIC SEEDING (UPLOAD PAPERS / NOTES) -----------------
+# ----------------- PERSISTENT CHAT HISTORY & COMPUTE-GATED CHAT -----------------
+@app.get("/api/chat/history")
+async def get_chat_history(user_id: str = Depends(decode_session_token)):
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+        SELECT user_message, ai_reply, credits_used, created_at
+        FROM chat_logs WHERE user_id = %s
+        ORDER BY id DESC LIMIT 25;
+        """, (user_id,))
+        rows = [dict(r) for r in reversed(cur.fetchall())]
+    conn.close()
+    return {"history": rows}
+
+@app.post("/api/chat")
+async def agent_chat(req: ChatRequest, user_id: str = Depends(decode_session_token)):
+    msg = req.message.strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    if len(msg) > 500:
+        raise HTTPException(status_code=400, detail="Message exceeds 500-character limit.")
+
+    check_rate_limit(user_id, max_calls=6, window_sec=60)
+
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT name, compute_credits FROM users WHERE id = %s;", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="User not found")
+
+        credits = int(row["compute_credits"])
+        if credits < CHAT_COST_CREDITS:
+            conn.close()
+            # Graceful Compute-Gated AI Refusal with Instant M-Pesa Top-Up Widget
+            return {
+                "reply": "⚡ **Intelligence Quota Depleted.** Your MuAI node requires compute credits to execute sub-agent routing, RAG searches, and SPNE negotiations. Top up from **KES 20** via M-Pesa or allocate from your Escrow Wallet in Billing.",
+                "action_widget": {
+                    "type": "COMPUTE_TOPUP",
+                    "title": "Top Up 5,000 Compute Credits",
+                    "counterparty": "MuAI Compute Gateway",
+                    "price_kes": 50.0,
+                    "display_price_kes": 50,
+                    "deal_id": f"topup-{uuid.uuid4().hex[:6]}"
+                },
+                "credits_remaining": credits
+            }
+
+        cur.execute("UPDATE users SET compute_credits = compute_credits - %s WHERE id = %s;", (CHAT_COST_CREDITS, user_id))
+    conn.commit()
+    conn.close()
+
+    res = await run_muai_agent(user_id=user_id, user_name=row["name"], message=msg)
+    res["credits_remaining"] = credits - CHAT_COST_CREDITS
+    return res
+
+# ----------------- COMPUTE-GATED DOCUMENT SEEDING -----------------
 @app.post("/api/documents/upload")
 async def upload_academic_doc(
     file: UploadFile = File(...),
     user_id: str = Depends(decode_session_token)
 ):
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT compute_credits FROM users WHERE id = %s;", (user_id,))
+        row = cur.fetchone()
+        if not row or int(row["compute_credits"]) < UPLOAD_COST_CREDITS:
+            conn.close()
+            raise HTTPException(
+                status_code=402,
+                detail="Insufficient Compute Credits (need 100 credits to index & verify documents). Top up via Billing / M-Pesa."
+            )
+    conn.close()
+
     file_bytes = await file.read()
     if len(file_bytes) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File exceeds 10MB limit.")
@@ -213,22 +335,16 @@ async def upload_academic_doc(
     )
     if not result.get("accepted"):
         raise HTTPException(status_code=400, detail=result.get("reason", "Upload rejected"))
-    return result
 
-# ----------------- ADK 2.0 AGENT CHAT -----------------
-@app.post("/api/chat")
-async def agent_chat(req: ChatRequest, user_id: str = Depends(decode_session_token)):
     conn = get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT name FROM users WHERE id = %s;", (user_id,))
-        row = cur.fetchone()
+        cur.execute("UPDATE users SET compute_credits = GREATEST(0, compute_credits - %s) WHERE id = %s;", (UPLOAD_COST_CREDITS, user_id))
+    conn.commit()
     conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="User not found")
 
-    return await run_muai_agent(user_id=user_id, user_name=row["name"], message=req.message)
+    return result
 
-# ----------------- MYHUMAN NETWORK FEED & THREADS -----------------
+# ----------------- MYHUMAN NETWORK FEED & PEER CLAIMING -----------------
 @app.get("/api/feed")
 async def get_feed(category: Optional[str] = None):
     conn = get_conn()
@@ -239,11 +355,14 @@ async def get_feed(category: Optional[str] = None):
             cur.execute("SELECT * FROM posts ORDER BY created_at DESC LIMIT 40;")
         posts = [dict(r) for r in cur.fetchall()]
 
+        active_open_count = 0
         for p in posts:
             cur.execute("SELECT COUNT(*) AS cnt FROM comments WHERE post_id = %s;", (p["id"],))
             p["comments_count"] = cur.fetchone()["cnt"]
+            if p["status"] in ("OPEN", "SPNE Cleared", "Negotiated"):
+                active_open_count += 1
     conn.close()
-    return posts
+    return {"posts": posts, "active_count": active_open_count}
 
 @app.get("/api/thread/{post_id}")
 async def get_thread(post_id: str):
@@ -259,7 +378,44 @@ async def get_thread(post_id: str):
     conn.close()
     return {"post": dict(post), "comments": comments}
 
-# ----------------- WORMHOLES (EPHEMERAL EDGES) -----------------
+@app.post("/api/feed/{post_id}/fulfill")
+async def fulfill_peer_post(post_id: str, user_id: str = Depends(decode_session_token)):
+    """Allows any logged-in student to claim a peer's open MyHuman intent and spawn a shared E2EE Wormhole."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT name, aura FROM users WHERE id = %s;", (user_id,))
+        claimer = cur.fetchone()
+        cur.execute("SELECT * FROM posts WHERE id = %s;", (post_id,))
+        post = cur.fetchone()
+        if not post or not claimer:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Post not found")
+        if post["author_user_id"] == user_id:
+            conn.close()
+            raise HTTPException(status_code=400, detail="You cannot claim your own broadcast.")
+
+        cur.execute("UPDATE posts SET status = 'CLAIMED' WHERE id = %s;", (post_id,))
+        agent_label = f"Agent #{user_id[-4:].upper()} ({claimer['name']})"
+        cur.execute("""
+        INSERT INTO comments (id, post_id, agent_id, aura_score, comment_text, sys_action)
+        VALUES (%s, %s, %s, %s, %s, '[Peer Claim Accepted: Shared E2EE Wormhole Spawned]');
+        """, (f"cm-{uuid.uuid4().hex[:6]}", post_id, agent_label, claimer["aura"], f"My human ({claimer['name']}) has claimed this task and opened a shared Wormhole with {post['author_name']}."))
+
+        wh_id = f"wh-{uuid.uuid4().hex[:6]}"
+        cur.execute("""
+        INSERT INTO wormholes (id, user_id, peer_user_id, title, counterparty, escrow_kes, status)
+        VALUES (%s, %s, %s, %s, %s, 0.00, 'ACTIVE');
+        """, (wh_id, post["author_user_id"], user_id, post["title"], f"{post['author_name']} ↔ {claimer['name']}"))
+
+        cur.execute("""
+        INSERT INTO wormhole_messages (wormhole_id, sender_role, sender_name, message)
+        VALUES (%s, 'arbiter', 'Arbiter Daemon', %s);
+        """, (wh_id, f"Shared Peer Wormhole active between {post['author_name']} and {claimer['name']}. Coordinate handoff here."))
+    conn.commit()
+    conn.close()
+    return {"status": "CLAIMED", "wormhole_id": wh_id}
+
+# ----------------- WORMHOLES -----------------
 def spawn_wormhole_sync(user_id: str, title: str, counterparty: str, amount_kes: float) -> str:
     wh_id = f"wh-{uuid.uuid4().hex[:6]}"
     conn = get_conn()
@@ -280,7 +436,7 @@ def spawn_wormhole_sync(user_id: str, title: str, counterparty: str, amount_kes:
 async def get_wormhole(wh_id: str, user_id: str = Depends(decode_session_token)):
     conn = get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM wormholes WHERE id = %s AND user_id = %s;", (wh_id, user_id))
+        cur.execute("SELECT * FROM wormholes WHERE id = %s AND (user_id = %s OR peer_user_id = %s);", (wh_id, user_id, user_id))
         wh = cur.fetchone()
         if not wh:
             conn.close()
@@ -298,7 +454,7 @@ async def send_wormhole_message(wh_id: str, req: WormholeMsgRequest, user_id: st
     with conn.cursor() as cur:
         cur.execute("SELECT name FROM users WHERE id = %s;", (user_id,))
         u = cur.fetchone()
-        cur.execute("SELECT * FROM wormholes WHERE id = %s AND user_id = %s;", (wh_id, user_id))
+        cur.execute("SELECT * FROM wormholes WHERE id = %s AND (user_id = %s OR peer_user_id = %s);", (wh_id, user_id, user_id))
         wh = cur.fetchone()
         if not wh or not u:
             conn.close()
@@ -306,7 +462,7 @@ async def send_wormhole_message(wh_id: str, req: WormholeMsgRequest, user_id: st
         cur.execute("""
         INSERT INTO wormhole_messages (wormhole_id, sender_role, sender_name, message)
         VALUES (%s, 'user', %s, %s);
-        """, (wh_id, u["name"], req.message))
+        """, (wh_id, u["name"], req.message[:500]))
     conn.commit()
     conn.close()
     return {"status": "sent"}
@@ -315,7 +471,7 @@ async def send_wormhole_message(wh_id: str, req: WormholeMsgRequest, user_id: st
 async def release_wormhole(wh_id: str, user_id: str = Depends(decode_session_token)):
     conn = get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM wormholes WHERE id = %s AND user_id = %s AND status = 'ACTIVE';", (wh_id, user_id))
+        cur.execute("SELECT * FROM wormholes WHERE id = %s AND (user_id = %s OR peer_user_id = %s) AND status = 'ACTIVE';", (wh_id, user_id, user_id))
         wh = cur.fetchone()
         if not wh:
             conn.close()
@@ -328,6 +484,8 @@ async def release_wormhole(wh_id: str, user_id: str = Depends(decode_session_tok
     conn.commit()
     conn.close()
     commit_ledger(user_id, f"Completed Edge: {wh['title']}", 20.0, 0.0)
+    if wh.get("peer_user_id") and wh["peer_user_id"] != user_id:
+        commit_ledger(wh["peer_user_id"], f"Completed Peer Edge: {wh['title']}", 20.0, 0.0)
     return {"status": "COLLAPSED", "aura_minted": 20}
 
 # ----------------- INTASEND M-PESA & WEBHOOKS -----------------
@@ -400,15 +558,16 @@ def fulfill_payment_sync(invoice_id: str, api_ref: str, amount: float) -> Option
     conn.close()
 
     if purpose == "COMPUTE_TOPUP":
+        credits_added = int(amount * 100)  # 1 KES = 100 Compute Credits
         conn = get_conn()
         with conn.cursor() as cur:
-            cur.execute("UPDATE users SET compute_credits = compute_credits + 50000 WHERE id = %s;", (user_id,))
+            cur.execute("UPDATE users SET compute_credits = compute_credits + %s WHERE id = %s;", (credits_added, user_id))
         conn.commit()
         conn.close()
-        commit_ledger(user_id, f"Compute Credits Topup (#{invoice_id})", 5.0, 0.0)
+        commit_ledger(user_id, f"Purchased {credits_added} Compute Credits (#{invoice_id})", 5.0, 0.0)
         return None
     else:
-        commit_ledger(user_id, f"M-Pesa Escrow Locked (#{invoice_id})", 15.0, amount)
+        commit_ledger(user_id, f"M-Pesa Escrow Funded (#{invoice_id})", 15.0, amount)
         return spawn_wormhole_sync(user_id, deal_title, "Verified Peer Agent", amount)
 
 # ----------------- STATIC & ROOT SPA -----------------
