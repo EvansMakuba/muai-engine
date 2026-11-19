@@ -23,7 +23,10 @@ EMBEDDING_MODEL = "gemini-embedding-2"
 def get_genai_client():
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured in .env")
-    return genai.Client(api_key=GEMINI_API_KEY)
+    return genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=12000)
+    )
 
 def get_deepseek_client():
     if not DEEPSEEK_API_KEY:
@@ -118,7 +121,7 @@ def extract_text_from_upload(file_bytes: bytes, filename: str, content_type: str
     return extracted
 
 def verify_academic_content(text_sample: str, filename: str) -> Dict[str, Any]:
-    """Verifies upload using gemini-flash-latest with DeepSeek V3 fallback on 503/429."""
+    """Verifies upload using DeepSeek V3 first (~1s) with gemini-flash-latest fallback."""
     prompt = f"""
     Inspect this uploaded university document snippet (filename: {filename}) and return ONLY raw JSON:
     {{
@@ -133,31 +136,31 @@ def verify_academic_content(text_sample: str, filename: str) -> Dict[str, Any]:
     Document snippet:
     {text_sample[:3000]}
     """
-    if GEMINI_API_KEY:
+    ds = get_deepseek_client()
+    if ds:
         try:
-            client = get_genai_client()
-            resp = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+            resp = ds.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.1
             )
-            raw = (resp.text or "{}").strip().replace("```json", "").replace("```", "")
+            raw = (resp.choices[0].message.content or "{}").strip()
             return json.loads(raw)
         except Exception:
             pass
 
-    ds = get_deepseek_client()
-    if ds:
-        resp = ds.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.1
+    if GEMINI_API_KEY:
+        client = get_genai_client()
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
-        raw = (resp.choices[0].message.content or "{}").strip()
+        raw = (resp.text or "{}").strip().replace("```json", "").replace("```", "")
         return json.loads(raw)
 
-    raise RuntimeError("Both gemini-flash-latest and deepseek-chat failed.")
+    raise RuntimeError("Both deepseek-chat and gemini-flash-latest failed.")
 
 def ingest_document(uploader_id: str, file_bytes: bytes, filename: str, content_type: str) -> Dict[str, Any]:
     """Full Seeding Pipeline: Extract -> Verify -> Embed (gemini-embedding-2) -> Mint +25 Aura."""
@@ -194,7 +197,6 @@ def ingest_document(uploader_id: str, file_bytes: bytes, filename: str, content_
             VALUES (%s, %s, %s, %s::vector);
             """, (doc_id, uploader_id, chunk, vec_to_pg(vec)))
 
-        # Also store direct multimodal embedding if uploaded as an image
         if content_type.startswith("image/") or any(filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg"]):
             try:
                 mime = content_type if content_type.startswith("image/") else "image/jpeg"
