@@ -1,7 +1,6 @@
 import os
 import hmac
 import uuid
-from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
@@ -65,7 +64,6 @@ def init_all():
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
         """)
-        # Seed initial demo posts if MyHuman is empty
         cur.execute("SELECT COUNT(*) AS cnt FROM posts;")
         if cur.fetchone()["cnt"] == 0:
             cur.execute("""
@@ -108,7 +106,7 @@ class STKPushRequest(BaseModel):
     amount: float
     purpose: str = "ESCROW_LOCK"
     deal_id: str = "deal-001"
-    title: Optional[str] = "Campus Escrow Contract"
+    title: Optional[str] = "Campus Escrow"
     counterparty: Optional[str] = "Verified Peer Agent"
 
 class StatusCheckRequest(BaseModel):
@@ -228,8 +226,7 @@ async def agent_chat(req: ChatRequest, user_id: str = Depends(decode_session_tok
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
 
-    res = await run_muai_agent(user_id=user_id, user_name=row["name"], message=req.message)
-    return res
+    return await run_muai_agent(user_id=user_id, user_name=row["name"], message=req.message)
 
 # ----------------- MYHUMAN NETWORK FEED & THREADS -----------------
 @app.get("/api/feed")
@@ -340,7 +337,8 @@ async def trigger_stk_push(req: STKPushRequest, user_id: str = Depends(decode_se
         raise HTTPException(status_code=500, detail="IntaSend Secret Key not configured.")
 
     phone = clean_phone(req.phone_number)
-    api_ref = f"{req.purpose}:{user_id}:{req.deal_id}:{req.title[:30]}"
+    safe_title = (req.title or "Escrow").replace(":", "-")[:24]
+    api_ref = f"{req.purpose}:{user_id}:{req.deal_id}:{safe_title}"
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -381,23 +379,25 @@ async def intasend_webhook(request: Request):
     return Response(status_code=200, content="OK")
 
 def fulfill_payment_sync(invoice_id: str, api_ref: str, amount: float) -> Optional[str]:
+    parts = api_ref.split(":") if api_ref else []
+    purpose = parts[0] if len(parts) > 0 else "ESCROW_LOCK"
+    user_id = parts[1] if len(parts) > 1 else "kevin"
+    deal_title = ":".join(parts[3:]) if len(parts) > 3 else "Campus Escrow Contract"
+
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT invoice_id FROM processed_invoices WHERE invoice_id = %s;", (invoice_id,))
         if cur.fetchone():
+            cur.execute("SELECT id FROM wormholes WHERE user_id = %s AND status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1;", (user_id,))
+            existing_wh = cur.fetchone()
             conn.close()
-            return None
+            return existing_wh["id"] if existing_wh else None
         cur.execute("""
         INSERT INTO processed_invoices (invoice_id, state, amount, api_ref)
         VALUES (%s, 'COMPLETE', %s, %s);
         """, (invoice_id, amount, api_ref))
     conn.commit()
     conn.close()
-
-    parts = api_ref.split(":") if api_ref else []
-    purpose = parts[0] if len(parts) > 0 else "ESCROW_LOCK"
-    user_id = parts[1] if len(parts) > 1 else "kevin"
-    deal_title = parts[3] if len(parts) > 3 else "Campus Escrow Contract"
 
     if purpose == "COMPUTE_TOPUP":
         conn = get_conn()
