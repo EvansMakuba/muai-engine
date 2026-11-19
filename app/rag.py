@@ -17,6 +17,9 @@ load_dotenv(".env")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
+GEMINI_MODEL = "gemini-flash-latest"
+EMBEDDING_MODEL = "gemini-embedding-2"
+
 def get_genai_client():
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured in .env")
@@ -27,22 +30,37 @@ def get_deepseek_client():
         return None
     return OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-def embed_text(text: str) -> List[float]:
-    """Generates a 768-dim embedding using Gemini Embedding API."""
+def embed_document_chunk(content: str, title: str = "none") -> List[float]:
+    """Asymmetric document embedding via gemini-embedding-2 (auto-normalized 768-dim)."""
     client = get_genai_client()
-    last_err = None
-    for model_name in ["gemini-embedding-001", "text-embedding-004"]:
-        try:
-            res = client.models.embed_content(
-                model=model_name,
-                contents=text,
-                config=types.EmbedContentConfig(output_dimensionality=768)
-            )
-            return list(res.embeddings[0].values)
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"All embedding models failed: {last_err}")
+    formatted = f"title: {title} | text: {content}"
+    res = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=formatted,
+        config=types.EmbedContentConfig(output_dimensionality=768)
+    )
+    return list(res.embeddings[0].values)
+
+def embed_query(query: str) -> List[float]:
+    """Asymmetric QA query embedding via gemini-embedding-2 (auto-normalized 768-dim)."""
+    client = get_genai_client()
+    formatted = f"task: question answering | query: {query}"
+    res = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=formatted,
+        config=types.EmbedContentConfig(output_dimensionality=768)
+    )
+    return list(res.embeddings[0].values)
+
+def embed_image_bytes(image_bytes: bytes, mime_type: str) -> List[float]:
+    """Direct multimodal embedding of images/diagrams into the unified 768-dim space."""
+    client = get_genai_client()
+    res = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime_type)],
+        config=types.EmbedContentConfig(output_dimensionality=768)
+    )
+    return list(res.embeddings[0].values)
 
 def vec_to_pg(vec: List[float]) -> str:
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
@@ -59,23 +77,8 @@ def chunk_text(text: str, chunk_size: int = 850, overlap: int = 150) -> List[str
         start += chunk_size - overlap
     return chunks
 
-def _gemini_vision_ocr(file_bytes: bytes, mime_type: str, prompt: str) -> str:
-    client = get_genai_client()
-    last_err = None
-    for model_name in ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"]:
-        try:
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt]
-            )
-            return (resp.text or "").strip()
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"Vision OCR unavailable: {last_err}")
-
 def extract_text_from_upload(file_bytes: bytes, filename: str, content_type: str) -> str:
-    """Extracts text from PDF, images, or plain text using pypdf + Gemini Vision OCR."""
+    """Extracts text from PDF, images, or plain text using pypdf + gemini-flash-latest OCR."""
     lower = filename.lower()
     extracted = ""
 
@@ -88,26 +91,34 @@ def extract_text_from_upload(file_bytes: bytes, filename: str, content_type: str
             extracted = ""
 
         if len(extracted) < 80:
-            extracted = _gemini_vision_ocr(
-                file_bytes,
-                "application/pdf",
-                "Transcribe all academic text, questions, formulas, and notes from this document accurately."
+            client = get_genai_client()
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"),
+                    "Transcribe all academic text, questions, formulas, and notes from this document accurately."
+                ]
             )
+            extracted = (resp.text or "").strip()
 
     elif any(lower.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]) or content_type.startswith("image/"):
         mime = content_type if content_type.startswith("image/") else "image/jpeg"
-        extracted = _gemini_vision_ocr(
-            file_bytes,
-            mime,
-            "Transcribe all academic text, exam questions, equations, and handwritten notes from this image accurately."
+        client = get_genai_client()
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part.from_bytes(data=file_bytes, mime_type=mime),
+                "Transcribe all academic text, exam questions, equations, and handwritten notes from this image accurately."
+            ]
         )
+        extracted = (resp.text or "").strip()
     else:
         extracted = file_bytes.decode("utf-8", errors="ignore").strip()
 
     return extracted
 
 def verify_academic_content(text_sample: str, filename: str) -> Dict[str, Any]:
-    """Verifies upload is genuine academic material using Gemini with DeepSeek fallback."""
+    """Verifies upload using gemini-flash-latest with DeepSeek V3 fallback on 503/429."""
     prompt = f"""
     Inspect this uploaded university document snippet (filename: {filename}) and return ONLY raw JSON:
     {{
@@ -122,22 +133,19 @@ def verify_academic_content(text_sample: str, filename: str) -> Dict[str, Any]:
     Document snippet:
     {text_sample[:3000]}
     """
-    # Try Gemini models first
     if GEMINI_API_KEY:
-        client = get_genai_client()
-        for model_name in ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"]:
-            try:
-                resp = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
-                )
-                raw = (resp.text or "{}").strip().replace("```json", "").replace("```", "")
-                return json.loads(raw)
-            except Exception:
-                continue
+        try:
+            client = get_genai_client()
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+            )
+            raw = (resp.text or "{}").strip().replace("```json", "").replace("```", "")
+            return json.loads(raw)
+        except Exception:
+            pass
 
-    # Automatic Fallback to DeepSeek V3
     ds = get_deepseek_client()
     if ds:
         resp = ds.chat.completions.create(
@@ -149,10 +157,10 @@ def verify_academic_content(text_sample: str, filename: str) -> Dict[str, Any]:
         raw = (resp.choices[0].message.content or "{}").strip()
         return json.loads(raw)
 
-    raise RuntimeError("Both Gemini and DeepSeek verification failed.")
+    raise RuntimeError("Both gemini-flash-latest and deepseek-chat failed.")
 
 def ingest_document(uploader_id: str, file_bytes: bytes, filename: str, content_type: str) -> Dict[str, Any]:
-    """Full Seeding Pipeline: Extract -> Verify -> Embed into pgvector -> Mint +25 Aura."""
+    """Full Seeding Pipeline: Extract -> Verify -> Embed (gemini-embedding-2) -> Mint +25 Aura."""
     text = extract_text_from_upload(file_bytes, filename, content_type)
     if len(text) < 40:
         return {"accepted": False, "reason": "Could not extract readable academic text from this file."}
@@ -180,11 +188,24 @@ def ingest_document(uploader_id: str, file_bytes: bytes, filename: str, content_
         """, (doc_id, uploader_id, course_code, title, doc_type, summary, aura_reward))
 
         for chunk in chunks[:30]:
-            vec = embed_text(chunk)
+            vec = embed_document_chunk(chunk, title=f"{course_code} - {title}")
             cur.execute("""
             INSERT INTO document_chunks (document_id, uploader_id, chunk_text, embedding)
             VALUES (%s, %s, %s, %s::vector);
             """, (doc_id, uploader_id, chunk, vec_to_pg(vec)))
+
+        # Also store direct multimodal embedding if uploaded as an image
+        if content_type.startswith("image/") or any(filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg"]):
+            try:
+                mime = content_type if content_type.startswith("image/") else "image/jpeg"
+                img_vec = embed_image_bytes(file_bytes, mime)
+                cur.execute("""
+                INSERT INTO document_chunks (document_id, uploader_id, chunk_text, embedding)
+                VALUES (%s, %s, %s, %s::vector);
+                """, (doc_id, uploader_id, f"[Visual Diagram / Scan: {course_code} - {title}]\n{text[:600]}", vec_to_pg(img_vec)))
+            except Exception:
+                pass
+
     conn.commit()
     conn.close()
 
@@ -203,8 +224,8 @@ def ingest_document(uploader_id: str, file_bytes: bytes, filename: str, content_
     }
 
 def query_campus_knowledge(query_text: str, querier_id: str, top_k: int = 4) -> Dict[str, Any]:
-    """Searches pgvector for academic matches and pays +1 Aura Epistemic Royalties to uploaders."""
-    query_vec = embed_text(query_text)
+    """Searches pgvector using gemini-embedding-2 and pays +1 Aura Epistemic Royalties."""
+    query_vec = embed_query(query_text)
     vec_str = vec_to_pg(query_vec)
 
     conn = get_conn()
