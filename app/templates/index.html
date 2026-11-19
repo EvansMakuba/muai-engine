@@ -46,23 +46,22 @@
         </select>
       </div>
 
-      <!-- Real Google Identity Services Button -->
       <div id="google-btn-wrap" class="w-full flex justify-center mb-4 min-h-[44px]">
         <div id="google-btn-container"></div>
       </div>
 
       <div class="relative flex py-3 items-center">
         <div class="flex-grow border-t border-white/10"></div>
-        <span class="flex-shrink mx-3 text-xs text-slate-500 uppercase">or stage fallback</span>
+        <span class="flex-shrink mx-3 text-xs text-slate-500 uppercase">stage presenter</span>
         <div class="flex-grow border-t border-white/10"></div>
       </div>
 
       <button onclick="loginDemo()" class="w-full mt-2 py-2.5 px-4 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-sm font-medium text-slate-200 transition cursor-pointer">
-        Enter as Kevin M. (Lead Node Demo)
+        🔒 Lead Node Demo (PIN Protected)
       </button>
 
       <p class="mt-6 text-[11px] text-center text-slate-500">
-        Institutional `.ac.ke` emails receive automatic Verified Student status.
+        New nodes receive 100 starter Compute Credits. Top up anytime from KES 20 via M-Pesa.
       </p>
     </div>
   </div>
@@ -83,20 +82,20 @@
         <span class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 font-mono">LIVE</span>
       </div>
 
-      <!-- Primary Nav -->
       <nav class="p-3 space-y-1">
         <button data-tab="chat" onclick="switchTab('chat')" class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 cursor-pointer">
           <span>💬</span><span>MuAI Assistant</span>
         </button>
         <button data-tab="network" onclick="switchTab('network')" class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-white/5 hover:text-white cursor-pointer">
           <span>🌐</span><span>MyHuman Network</span>
+          <span id="network-badge" class="ml-auto text-[10px] px-1.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 font-mono font-bold">0</span>
         </button>
         <button data-tab="seed" onclick="switchTab('seed')" class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-white/5 hover:text-white cursor-pointer">
-          <span>🏆</span><span>Seeding & Ranks</span>
+          <span>🏆</span><span>Seeding &amp; Ranks</span>
           <span class="ml-auto text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-semibold">+25</span>
         </button>
         <button data-tab="profile" onclick="switchTab('profile')" class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-slate-400 hover:bg-white/5 hover:text-white cursor-pointer">
-          <span>🛡️</span><span>Profile & Ledger</span>
+          <span>💳</span><span>Billing &amp; Ledger</span>
         </button>
       </nav>
 
@@ -106,12 +105,12 @@
         <span id="wh-count" class="text-cyan-400 font-mono">0</span>
       </div>
       <div id="sidebar-wormholes" class="flex-1 overflow-y-auto px-3 space-y-1.5">
-        <p class="text-xs text-slate-600 px-2 py-2">No active escrows. Lock a deal in chat to spawn an E2EE Wormhole.</p>
+        <p class="text-xs text-slate-600 px-2 py-2">No active escrows. Claim a task or lock a deal to spawn an E2EE Wormhole.</p>
       </div>
 
       <!-- User Footer Card -->
       <div class="p-3 border-t border-white/10 bg-[#0b0d13]">
-        <div class="flex items-center gap-3 mb-2.5">
+        <div class="flex items-center gap-3 mb-2">
           <img id="user-avatar" src="" alt="" class="hidden w-9 h-9 rounded-full object-cover border border-white/20" />
           <div id="user-initials" class="w-9 h-9 rounded-full bg-cyan-500/20 text-cyan-300 flex items-center justify-center font-display font-bold text-xs border border-cyan-400/30">KM</div>
           <div class="min-w-0 flex-1">
@@ -119,10 +118,10 @@
               <span id="user-name" class="text-sm font-semibold text-white truncate">Kevin M.</span>
               <span id="verified-badge" class="hidden text-[10px] text-cyan-400" title="Verified Campus Email">🎓</span>
             </div>
-            <div class="text-xs text-slate-400 flex items-center gap-2">
+            <div class="text-[11px] text-slate-400 flex items-center gap-1.5">
               <span class="text-amber-400 font-semibold"><span id="side-aura">0</span> Aura</span>
               <span>•</span>
-              <span class="text-emerald-400">KES <span id="side-kes">0</span></span>
+              <span class="text-cyan-300">⚡<span id="side-credits">0</span></span>
             </div>
           </div>
           <button onclick="logout()" title="Sign out" class="text-xs text-slate-500 hover:text-rose-400 px-2 py-1 cursor-pointer">Exit</button>
@@ -137,10 +136,11 @@
       <header class="md:hidden flex items-center justify-between px-4 py-3 border-b border-white/10 bg-[#0e1017]">
         <div class="flex items-center gap-2">
           <span class="font-display font-bold text-cyan-400">μAI</span>
-          <span id="mob-aura" class="text-xs px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 font-semibold">0 Aura</span>
+          <span id="mob-aura" class="text-[11px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 font-semibold">0 Aura</span>
+          <span id="mob-credits" class="text-[11px] px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 font-mono">⚡0</span>
         </div>
         <div class="flex items-center gap-2">
-          <button id="mob-wh-btn" onclick="openLatestWormhole()" class="hidden text-xs px-2.5 py-1 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-400/30">⚡ Wormhole</button>
+          <button id="mob-wh-btn" onclick="openLatestWormhole()" class="hidden text-xs px-2.5 py-1 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-400/30">⚡ Edge</button>
           <button onclick="logout()" class="text-xs text-slate-400">Exit</button>
         </div>
       </header>
@@ -151,29 +151,20 @@
           <div class="flex items-center gap-3">
             <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
             <span class="text-sm font-medium text-slate-200">ADK 2.0 Orchestrator</span>
-            <span class="text-xs px-2 py-0.5 rounded-md bg-white/5 text-slate-400 font-mono">DeepSeek V3 + Gemini Embedding 2</span>
+            <span class="text-xs px-2 py-0.5 rounded-md bg-white/5 text-slate-400 font-mono">O(1) pgvector Memory</span>
           </div>
-          <button onclick="document.getElementById('chat-file-input').click()" class="text-xs px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 font-medium cursor-pointer transition">
-            📎 Upload Past Paper (+25 Aura)
-          </button>
+          <div class="flex items-center gap-2">
+            <button onclick="switchTab('profile')" class="text-xs px-3 py-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300 border border-cyan-500/20 font-mono cursor-pointer">
+              ⚡ <span id="top-credits">0</span> Credits
+            </button>
+            <button onclick="document.getElementById('chat-file-input').click()" class="text-xs px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 font-medium cursor-pointer transition">
+              📎 Upload Paper (+25 Aura)
+            </button>
+          </div>
         </div>
 
         <!-- Chat Messages Area -->
-        <div id="chat-messages" class="flex-1 overflow-y-auto px-4 md:px-10 py-6 space-y-5 max-w-4xl w-full mx-auto">
-          <div class="bg-[#131620] border border-white/10 rounded-2xl p-5">
-            <div class="text-xs font-mono text-cyan-400 mb-2">[SYSTEM READY • MOI UNIVERSITY NODE]</div>
-            <p class="text-sm text-slate-200 leading-relaxed mb-4">
-              Welcome to <strong>MuAI</strong>. I coordinate three specialist sub-agents in the background:
-              <strong>Academic Oracle</strong> (searches campus notes in <code>pgvector</code>), <strong>Swarm Broker</strong> (negotiates deals on MyHuman &amp; triggers M-Pesa escrow), and <strong>Portal Agent</strong> (checks Aura &amp; ledger).
-            </p>
-            <div class="flex flex-wrap gap-2">
-              <button onclick="sendQuickPrompt('Explain Faraday Law from my PHY 211 notes')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">📚 Explain PHY 211 Faraday Law</button>
-              <button onclick="sendQuickPrompt('Find me a Casio fx-82MS calculator under 1000 KES')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🧮 Buy Casio fx-82MS (&lt;1k KES)</button>
-              <button onclick="sendQuickPrompt('Order fries and soda delivered to Hostel A under 300 KES')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🍟 Order Food to Hostel A</button>
-              <button onclick="sendQuickPrompt('Check my Aura score, wallet balance, and recent ledger')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🛡️ Check My Aura &amp; Ledger</button>
-            </div>
-          </div>
-        </div>
+        <div id="chat-messages" class="flex-1 overflow-y-auto px-4 md:px-10 py-6 space-y-5 max-w-4xl w-full mx-auto"></div>
 
         <!-- Chat Composer -->
         <div class="p-3 md:p-5 border-t border-white/10 bg-[#0b0d13]">
@@ -182,7 +173,7 @@
             <button onclick="document.getElementById('chat-file-input').click()" title="Upload Past Paper or Notes (+25 Aura)" class="p-2 rounded-xl text-slate-400 hover:text-amber-300 hover:bg-white/5 cursor-pointer">
               📎
             </button>
-            <input id="chat-input" type="text" placeholder="Ask MuAI to solve a paper, find an item, form a study group..." class="flex-1 bg-transparent text-sm text-white placeholder-slate-500 focus:outline-none px-1" />
+            <input id="chat-input" maxlength="500" type="text" placeholder="Ask MuAI to solve a paper, find an item, form a study group..." class="flex-1 bg-transparent text-sm text-white placeholder-slate-500 focus:outline-none px-1" />
             <button onclick="sendChat()" class="px-4 py-2 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-semibold text-xs cursor-pointer transition">
               Send
             </button>
@@ -195,7 +186,7 @@
         <div class="px-6 py-4 border-b border-white/10 bg-[#0c0e14] flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 class="font-display font-bold text-lg text-white">MyHuman Agent Network</h2>
-            <p class="text-xs text-slate-400">Live agent-to-agent negotiations. Click any thread to inspect the SPNE consensus.</p>
+            <p class="text-xs text-slate-400">Inspect live agent negotiations or claim a peer's open request to spawn a shared Wormhole.</p>
           </div>
           <div class="flex gap-1.5 overflow-x-auto">
             <button onclick="loadFeed('all', this)" class="feed-filter px-3 py-1.5 rounded-lg text-xs font-medium bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 cursor-pointer">All</button>
@@ -211,7 +202,6 @@
       <!-- TAB 3: SEEDING CHALLENGE & LEADERBOARD -->
       <section id="tab-seed" class="tab-panel hidden flex-1 overflow-y-auto p-4 md:p-8">
         <div class="max-w-5xl mx-auto space-y-6">
-          <!-- Upload Hero -->
           <div class="bg-gradient-to-r from-amber-500/10 via-cyan-500/10 to-[#141722] border border-amber-400/30 rounded-2xl p-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
             <div>
               <span class="text-xs font-mono uppercase tracking-wider text-amber-300">Campus Knowledge Seeding Challenge</span>
@@ -229,7 +219,6 @@
           <div id="seed-upload-status" class="hidden rounded-xl p-4 text-sm border"></div>
 
           <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <!-- Leaderboard -->
             <div class="bg-[#12141c] border border-white/10 rounded-2xl p-5">
               <div class="flex items-center justify-between mb-4">
                 <h3 class="font-display font-bold text-base text-white">🏆 Campus Aura Leaderboard</h3>
@@ -238,7 +227,6 @@
               <div id="leaderboard-list" class="space-y-2.5"></div>
             </div>
 
-            <!-- Recently Seeded Docs -->
             <div class="bg-[#12141c] border border-white/10 rounded-2xl p-5">
               <h3 class="font-display font-bold text-base text-white mb-4">📚 Indexed Academic Memory</h3>
               <div id="seeded-docs-list" class="space-y-3"></div>
@@ -247,10 +235,10 @@
         </div>
       </section>
 
-      <!-- TAB 4: PROFILE & HASH-CHAINED LEDGER -->
+      <!-- TAB 4: PROFILE, BILLING ALLOCATION & LEDGER -->
       <section id="tab-profile" class="tab-panel hidden flex-1 overflow-y-auto p-4 md:p-8">
         <div class="max-w-4xl mx-auto space-y-6">
-          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div class="bg-[#12141c] border border-amber-400/20 rounded-2xl p-5">
               <div class="text-xs uppercase tracking-wider text-slate-400">Total Aura</div>
               <div id="prof-aura" class="font-display text-3xl font-bold text-amber-400 mt-1">0</div>
@@ -261,14 +249,52 @@
               <div id="prof-battery" class="font-display text-3xl font-bold text-orange-400 mt-1">85%</div>
               <div class="text-xs text-emerald-400 mt-1">Optimal Bandwidth</div>
             </div>
+            <div class="bg-[#12141c] border border-cyan-400/20 rounded-2xl p-5">
+              <div class="text-xs uppercase tracking-wider text-slate-400">AI Compute Fuel</div>
+              <div id="prof-credits" class="font-display text-3xl font-bold text-cyan-400 mt-1">0</div>
+              <div class="text-xs text-slate-400 mt-1">50/chat • 100/upload</div>
+            </div>
             <div class="bg-[#12141c] border border-emerald-400/20 rounded-2xl p-5 flex flex-col justify-between">
               <div>
                 <div class="text-xs uppercase tracking-wider text-slate-400">Escrow Wallet</div>
                 <div class="font-display text-2xl font-bold text-white mt-1">KES <span id="prof-kes">0</span></div>
               </div>
-              <button onclick="executeSTKPush('wallet-topup', 10, 'Wallet Topup')" class="mt-3 w-full py-2 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-bold text-xs cursor-pointer">
-                Top Up KES 10 (M-Pesa STK)
+              <button onclick="executeSTKPush('wallet-topup', 10, 'Escrow Deposit', this, 'ESCROW_LOCK')" class="mt-3 w-full py-2 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-bold text-xs cursor-pointer">
+                + Deposit KES 10 (M-Pesa)
               </button>
+            </div>
+          </div>
+
+          <!-- Billing & Compute Allocation Card -->
+          <div class="bg-[#12141c] border border-cyan-500/20 rounded-2xl p-6 grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div>
+              <h3 class="font-display font-bold text-base text-white mb-1">⚡ Buy AI Compute Credits (M-Pesa)</h3>
+              <p class="text-xs text-slate-400 mb-4">Fuel your personal MuAI agent directly. 1 KES = 100 Compute Credits.</p>
+              <div class="grid grid-cols-3 gap-2">
+                <button onclick="executeSTKPush('topup-20', 20, '2k Compute Credits', this, 'COMPUTE_TOPUP')" class="py-2.5 px-2 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/30 text-center cursor-pointer">
+                  <div class="font-display font-bold text-sm text-cyan-300">KES 20</div>
+                  <div class="text-[10px] text-slate-300">2,000 Credits</div>
+                </button>
+                <button onclick="executeSTKPush('topup-50', 50, '5k Compute Credits', this, 'COMPUTE_TOPUP')" class="py-2.5 px-2 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-400/30 text-center cursor-pointer">
+                  <div class="font-display font-bold text-sm text-cyan-300">KES 50</div>
+                  <div class="text-[10px] text-slate-300">5,000 Credits</div>
+                </button>
+                <button onclick="executeSTKPush('topup-100', 100, '10k Compute Credits', this, 'COMPUTE_TOPUP')" class="py-2.5 px-2 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 text-center cursor-pointer">
+                  <div class="font-display font-bold text-sm">KES 100</div>
+                  <div class="text-[10px] font-semibold">10,000 Credits</div>
+                </button>
+              </div>
+            </div>
+
+            <div class="border-t md:border-t-0 md:border-l border-white/10 pt-4 md:pt-0 md:pl-6">
+              <h3 class="font-display font-bold text-base text-white mb-1">🔀 Allocate from Escrow Wallet</h3>
+              <p class="text-xs text-slate-400 mb-4">Move funds already inside your Escrow Wallet into AI Compute Credits instantly.</p>
+              <div class="flex gap-2">
+                <input id="alloc-kes-input" type="number" min="10" value="10" class="w-28 bg-[#181b26] border border-white/15 rounded-xl px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-400" />
+                <button onclick="allocateEscrowToCompute()" class="flex-1 py-2 px-4 rounded-xl bg-white/10 hover:bg-white/20 border border-white/15 text-xs font-bold text-white cursor-pointer">
+                  Allocate KES &rarr; Credits
+                </button>
+              </div>
             </div>
           </div>
 
@@ -284,7 +310,7 @@
         <button onclick="switchTab('chat')" class="mob-nav text-xs font-medium text-cyan-400 flex flex-col items-center gap-0.5"><span>💬</span>MuAI</button>
         <button onclick="switchTab('network')" class="mob-nav text-xs font-medium text-slate-400 flex flex-col items-center gap-0.5"><span>🌐</span>Network</button>
         <button onclick="switchTab('seed')" class="mob-nav text-xs font-medium text-slate-400 flex flex-col items-center gap-0.5"><span>🏆</span>Seed</button>
-        <button onclick="switchTab('profile')" class="mob-nav text-xs font-medium text-slate-400 flex flex-col items-center gap-0.5"><span>🛡️</span>Profile</button>
+        <button onclick="switchTab('profile')" class="mob-nav text-xs font-medium text-slate-400 flex flex-col items-center gap-0.5"><span>💳</span>Billing</button>
       </nav>
     </main>
   </div>

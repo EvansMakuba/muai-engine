@@ -4,10 +4,7 @@ let currentUser = null;
 let activeWormholeId = null;
 
 function authHeaders(extra = {}) {
-  return {
-    ...extra,
-    "Authorization": `Bearer ${authToken}`
-  };
+  return { ...extra, "Authorization": `Bearer ${authToken}` };
 }
 
 function formatMarkdown(text) {
@@ -53,9 +50,19 @@ async function initGoogleSignIn() {
 }
 
 async function loginDemo() {
-  const res = await fetch(`${API_BASE}/api/auth/demo`, { method: "POST" });
+  const pin = prompt("Enter Stage Presenter PIN:", "");
+  if (!pin) return;
+  const res = await fetch(`${API_BASE}/api/auth/demo`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pin })
+  });
   const data = await res.json();
-  if (data.token) completeLogin(data.token, data.user);
+  if (res.ok && data.token) {
+    completeLogin(data.token, data.user);
+  } else {
+    alert(data.detail || "Invalid PIN");
+  }
 }
 
 function completeLogin(token, user) {
@@ -65,6 +72,7 @@ function completeLogin(token, user) {
   document.getElementById("auth-view").classList.add("hidden");
   document.getElementById("app-shell").classList.remove("hidden");
   refreshMe();
+  loadChatHistory();
   loadFeed("all");
   loadLeaderboard();
 }
@@ -89,10 +97,13 @@ async function refreshMe() {
     document.getElementById("user-name").innerText = currentUser.name;
     document.getElementById("sidebar-campus").innerText = currentUser.campus || "Moi University";
     document.getElementById("side-aura").innerText = currentUser.aura;
-    document.getElementById("side-kes").innerText = currentUser.escrow_kes.toLocaleString();
+    document.getElementById("side-credits").innerText = currentUser.compute_credits;
+    document.getElementById("top-credits").innerText = currentUser.compute_credits;
     document.getElementById("mob-aura").innerText = `${currentUser.aura} Aura`;
+    document.getElementById("mob-credits").innerText = `⚡${currentUser.compute_credits}`;
     document.getElementById("prof-aura").innerText = currentUser.aura;
     document.getElementById("prof-battery").innerText = `${currentUser.battery}%`;
+    document.getElementById("prof-credits").innerText = currentUser.compute_credits;
     document.getElementById("prof-kes").innerText = currentUser.escrow_kes.toLocaleString();
 
     if (currentUser.is_verified_student) {
@@ -109,7 +120,7 @@ async function refreshMe() {
       document.getElementById("user-initials").innerText = initials;
     }
 
-    // Active Wormholes in sidebar
+    // Active Wormholes
     const whContainer = document.getElementById("sidebar-wormholes");
     const whList = data.wormholes || [];
     document.getElementById("wh-count").innerText = whList.length;
@@ -124,7 +135,7 @@ async function refreshMe() {
       `).join("");
     } else {
       document.getElementById("mob-wh-btn").classList.add("hidden");
-      whContainer.innerHTML = `<p class="text-xs text-slate-600 px-2 py-2">No active escrows. Lock a deal in chat to spawn an E2EE Wormhole.</p>`;
+      whContainer.innerHTML = `<p class="text-xs text-slate-600 px-2 py-2">No active escrows. Claim a task or lock a deal to spawn an E2EE Wormhole.</p>`;
     }
 
     // Ledger History
@@ -147,6 +158,27 @@ async function refreshMe() {
   }
 }
 
+// ---------------- BILLING ALLOCATION ----------------
+async function allocateEscrowToCompute() {
+  const input = document.getElementById("alloc-kes-input");
+  const amount = parseFloat(input.value || "0");
+  if (isNaN(amount) || amount < 10) {
+    return alert("Minimum allocation is KES 10.");
+  }
+  const res = await fetch(`${API_BASE}/api/billing/allocate`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ amount_kes: amount })
+  });
+  const data = await res.json();
+  if (res.ok) {
+    alert(`✓ Allocated KES ${amount} -> +${data.credits_added} AI Compute Credits!`);
+    refreshMe();
+  } else {
+    alert(data.detail || "Allocation failed.");
+  }
+}
+
 // ---------------- TABS ----------------
 function switchTab(tabName) {
   document.querySelectorAll(".tab-panel").forEach(p => p.classList.add("hidden"));
@@ -165,7 +197,41 @@ function switchTab(tabName) {
   if (tabName === "profile") refreshMe();
 }
 
-// ---------------- ADK 2.0 AGENT CHAT ----------------
+// ---------------- PERSISTENT CHAT HISTORY & MISSION CONTROL ----------------
+function renderMissionControlCard() {
+  return `
+    <div class="bg-[#131620] border border-white/10 rounded-2xl p-5">
+      <div class="text-xs font-mono text-cyan-400 mb-2">[MISSION CONTROL • MOI UNIVERSITY NODE]</div>
+      <p class="text-sm text-slate-200 leading-relaxed mb-4">
+        Your personal <strong>MuAI</strong> orchestrator is active. Upload a past paper for <strong>+25 Aura</strong>, query campus notes, or claim peer bounties in <strong>MyHuman</strong>.
+      </p>
+      <div class="flex flex-wrap gap-2">
+        <button onclick="sendQuickPrompt('Explain Faraday Law from my PHY 211 notes')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">📚 Explain PHY 211 Faraday Law</button>
+        <button onclick="sendQuickPrompt('Find me a Casio fx-82MS calculator under 1000 KES')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🧮 Buy Casio fx-82MS (&lt;1k KES)</button>
+        <button onclick="sendQuickPrompt('Order fries and soda delivered to Hostel A under 300 KES')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🍟 Order Food to Hostel A</button>
+        <button onclick="sendQuickPrompt('Check my Aura score, compute credits, and recent ledger')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🛡️ Check My Aura &amp; Credits</button>
+      </div>
+    </div>
+  `;
+}
+
+async function loadChatHistory() {
+  const box = document.getElementById("chat-messages");
+  box.innerHTML = renderMissionControlCard();
+  try {
+    const res = await fetch(`${API_BASE}/api/chat/history`, { headers: authHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+    (data.history || []).forEach(turn => {
+      box.innerHTML += `<div class="flex justify-end"><div class="max-w-xl bg-[#1d2130] border border-white/10 rounded-2xl rounded-br-sm px-4 py-3 text-sm text-white">${formatMarkdown(turn.user_message)}</div></div>`;
+      box.innerHTML += `<div class="flex justify-start"><div class="max-w-2xl bg-[#12141c] border-l-2 border-cyan-400 rounded-2xl rounded-bl-sm px-4 py-3 text-sm text-slate-200 leading-relaxed">${formatMarkdown(turn.ai_reply)}</div></div>`;
+    });
+    box.scrollTop = box.scrollHeight;
+  } catch (e) {
+    console.error("Chat history load error:", e);
+  }
+}
+
 function sendQuickPrompt(text) {
   document.getElementById("chat-input").value = text;
   sendChat();
@@ -185,7 +251,7 @@ async function sendChat() {
 
   const aiDiv = document.createElement("div");
   aiDiv.className = "flex justify-start";
-  aiDiv.innerHTML = `<div class="max-w-2xl bg-[#12141c] border-l-2 border-cyan-400 rounded-2xl rounded-bl-sm px-4 py-3 text-sm text-slate-300"><span class="text-xs font-mono text-cyan-400 block mb-1">[ADK 2.0 Coordinator]</span>Routing to specialist sub-agents...</div>`;
+  aiDiv.innerHTML = `<div class="max-w-2xl bg-[#12141c] border-l-2 border-cyan-400 rounded-2xl rounded-bl-sm px-4 py-3 text-sm text-slate-300"><span class="text-xs font-mono text-cyan-400 block mb-1">[ADK 2.0 • Recalling pgvector Memory]</span>Processing...</div>`;
   box.appendChild(aiDiv);
   box.scrollTop = box.scrollHeight;
 
@@ -197,17 +263,33 @@ async function sendChat() {
     });
     const data = await res.json();
 
+    if (!res.ok) {
+      aiDiv.innerHTML = `<div class="bg-amber-950/40 border border-amber-500/40 rounded-xl px-4 py-3 text-sm text-amber-200">${data.detail || "Request blocked."}</div>`;
+      return;
+    }
+
     let widgetHtml = "";
     if (data.action_widget) {
       const w = data.action_widget;
-      if (w.type === "SPNE_DEAL") {
+      if (w.type === "COMPUTE_TOPUP") {
+        widgetHtml = `
+          <div class="mt-4 bg-[#181c28] border border-amber-400/40 rounded-xl p-4">
+            <div class="font-display font-bold text-amber-300 text-sm mb-2">⚡ ${w.title}</div>
+            <div class="flex flex-wrap gap-2 mt-2">
+              <button onclick="executeSTKPush('topup-20', 20, '2k Compute Credits', this, 'COMPUTE_TOPUP')" class="flex-1 py-2 px-3 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs cursor-pointer">KES 20 (2k)</button>
+              <button onclick="executeSTKPush('topup-50', 50, '5k Compute Credits', this, 'COMPUTE_TOPUP')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">KES 50 (5k)</button>
+              <button onclick="switchTab('profile')" class="px-3 py-2 rounded-lg border border-white/15 text-xs text-slate-200 cursor-pointer">Billing / Allocate</button>
+            </div>
+          </div>
+        `;
+      } else if (w.type === "SPNE_DEAL") {
         widgetHtml = `
           <div class="mt-4 bg-[#181c28] border border-cyan-400/40 rounded-xl p-4">
             <div class="font-display font-bold text-cyan-300 text-sm mb-2">🤝 ${w.title}</div>
             <div class="text-xs text-slate-400 flex justify-between mb-1"><span>Counterparty</span><span class="text-white font-medium">${w.counterparty}</span></div>
-            <div class="text-xs text-slate-400 flex justify-between mb-3"><span>SPNE Price</span><span class="text-emerald-400 font-bold">KES ${w.display_price_kes} (Live Demo: KES ${w.price_kes})</span></div>
+            <div class="text-xs text-slate-400 flex justify-between mb-3"><span>SPNE Price</span><span class="text-emerald-400 font-bold">KES ${w.display_price_kes} (Demo: KES ${w.price_kes})</span></div>
             <div class="flex gap-2">
-              <button onclick="executeSTKPush('${w.deal_id}', ${w.price_kes}, '${w.title.replace(/'/g, '')}', this)" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">
+              <button onclick="executeSTKPush('${w.deal_id}', ${w.price_kes}, '${w.title.replace(/'/g, '')}', this, 'ESCROW_LOCK')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">
                 Approve &amp; Pay M-Pesa (KES ${w.price_kes})
               </button>
               <button onclick="this.closest('.mt-4').remove()" class="px-3 py-2 rounded-lg border border-white/15 text-xs text-slate-300 cursor-pointer">Decline</button>
@@ -229,7 +311,7 @@ async function sendChat() {
 
     aiDiv.innerHTML = `
       <div class="max-w-2xl bg-[#12141c] border-l-2 border-cyan-400 rounded-2xl rounded-bl-sm px-4 py-3 text-sm text-slate-200 leading-relaxed">
-        <span class="text-xs font-mono text-cyan-400 block mb-1">[MuAI Execution Complete]</span>
+        <span class="text-xs font-mono text-cyan-400 block mb-1">[MuAI Execution Complete • ${data.memories_recalled || 0} memories recalled]</span>
         ${formatMarkdown(data.reply)}
         ${widgetHtml}
       </div>
@@ -242,7 +324,7 @@ async function sendChat() {
   }
 }
 
-// ---------------- SEEDING UPLOAD (PAST PAPERS / NOTES) ----------------
+// ---------------- SEEDING UPLOAD ----------------
 async function handleFileUpload(inputEl, fromSeedTab = false) {
   const file = inputEl.files?.[0];
   if (!file) return;
@@ -254,7 +336,7 @@ async function handleFileUpload(inputEl, fromSeedTab = false) {
   const statusBox = document.getElementById("seed-upload-status");
   if (fromSeedTab && statusBox) {
     statusBox.className = "rounded-xl p-4 text-sm border border-cyan-500/40 bg-cyan-500/10 text-cyan-300";
-    statusBox.innerText = `⏳ Analyzing "${file.name}", running academic check, and embedding into pgvector...`;
+    statusBox.innerText = `⏳ Analyzing "${file.name}", verifying academic quality, and embedding into pgvector...`;
     statusBox.classList.remove("hidden");
   } else {
     const box = document.getElementById("chat-messages");
@@ -274,9 +356,10 @@ async function handleFileUpload(inputEl, fromSeedTab = false) {
       const errMsg = data.detail || "Upload rejected.";
       if (fromSeedTab && statusBox) {
         statusBox.className = "rounded-xl p-4 text-sm border border-rose-500/40 bg-rose-500/10 text-rose-300";
-        statusBox.innerText = `❌ ${errMsg}`;
+        statusBox.innerHTML = `❌ ${errMsg} ${res.status === 402 ? '<button onclick="switchTab(\'profile\')" class="ml-2 underline text-cyan-300 font-bold cursor-pointer">Top Up in Billing &rarr;</button>' : ''}`;
       } else {
         alert(errMsg);
+        if (res.status === 402) switchTab("profile");
       }
       return;
     }
@@ -298,7 +381,7 @@ async function handleFileUpload(inputEl, fromSeedTab = false) {
   }
 }
 
-// ---------------- MYHUMAN NETWORK ----------------
+// ---------------- MYHUMAN NETWORK & PEER CLAIMING ----------------
 async function loadFeed(category = "all", btnEl = null) {
   if (btnEl) {
     document.querySelectorAll(".feed-filter").forEach(b => {
@@ -311,7 +394,11 @@ async function loadFeed(category = "all", btnEl = null) {
   if (!container) return;
   try {
     const res = await fetch(`${API_BASE}/api/feed${category !== "all" ? "?category=" + encodeURIComponent(category) : ""}`);
-    const posts = await res.json();
+    const data = await res.json();
+    const posts = data.posts || [];
+    const badge = document.getElementById("network-badge");
+    if (badge) badge.innerText = data.active_count || 0;
+
     container.innerHTML = posts.map(p => `
       <div onclick="openThread('${p.id}')" class="p-5 hover:bg-white/[0.02] cursor-pointer transition">
         <div class="flex items-center gap-2 text-xs text-slate-400 font-mono mb-1">
@@ -319,7 +406,7 @@ async function loadFeed(category = "all", btnEl = null) {
           <span>•</span>
           <span>${p.author_agent}</span>
           <span>•</span>
-          <span class="text-emerald-400">${p.status}</span>
+          <span class="${p.status === 'CLAIMED' ? 'text-amber-400' : 'text-emerald-400'}">${p.status}</span>
         </div>
         <h3 class="font-semibold text-sm text-white mb-1">${p.title}</h3>
         <p class="text-xs text-slate-400 line-clamp-2 mb-2">${p.body}</p>
@@ -336,11 +423,21 @@ async function openThread(postId) {
   const data = await res.json();
   const p = data.post;
 
+  let claimBtn = "";
+  if (currentUser && p.author_user_id !== currentUser.id && p.status !== "CLAIMED") {
+    claimBtn = `
+      <button onclick="claimPeerPost('${p.id}')" class="mt-3 w-full py-2.5 px-4 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer transition">
+        🤝 Claim Task &amp; Open Shared E2EE Wormhole
+      </button>
+    `;
+  }
+
   let html = `
     <div class="bg-[#181c28] border border-white/10 rounded-xl p-4">
       <div class="text-xs font-mono text-cyan-400 mb-1">${p.category} • ${p.author_agent}</div>
       <h3 class="font-display font-bold text-base text-white mb-1">${p.title}</h3>
       <p class="text-xs text-slate-300 leading-relaxed">${p.body}</p>
+      ${claimBtn}
     </div>
     <div class="space-y-3 pl-3 border-l-2 border-cyan-500/30">
   `;
@@ -360,6 +457,22 @@ async function openThread(postId) {
 
   document.getElementById("thread-modal-body").innerHTML = html;
   document.getElementById("thread-modal").classList.remove("hidden");
+}
+
+async function claimPeerPost(postId) {
+  const res = await fetch(`${API_BASE}/api/feed/${postId}/fulfill`, {
+    method: "POST",
+    headers: authHeaders()
+  });
+  const data = await res.json();
+  if (res.ok) {
+    document.getElementById("thread-modal").classList.add("hidden");
+    await refreshMe();
+    await loadFeed("all");
+    if (data.wormhole_id) openWormhole(data.wormhole_id);
+  } else {
+    alert(data.detail || "Could not claim task.");
+  }
 }
 
 // ---------------- LEADERBOARD ----------------
@@ -397,9 +510,10 @@ async function loadLeaderboard() {
 }
 
 // ---------------- M-PESA STK PUSH & WORMHOLES ----------------
-async function executeSTKPush(dealId, amount, title, btnEl = null) {
-  const phone = prompt("Enter Safaricom Phone Number for M-Pesa STK Push (e.g. 2547XXXXXXXX):", "2547");
+async function executeSTKPush(dealId, amount, title, btnEl = null, purpose = "ESCROW_LOCK") {
+  const phone = prompt(`Enter Safaricom Phone Number for KES ${amount} M-Pesa STK Push (e.g. 2547XXXXXXXX):`, "2547");
   if (!phone) return;
+  const origText = btnEl ? btnEl.innerHTML : "";
   if (btnEl) { btnEl.innerText = "Sending STK..."; btnEl.disabled = true; }
 
   try {
@@ -409,30 +523,33 @@ async function executeSTKPush(dealId, amount, title, btnEl = null) {
       body: JSON.stringify({
         phone_number: phone,
         amount: amount,
-        purpose: dealId === "wallet-topup" ? "ESCROW_LOCK" : "ESCROW_LOCK",
+        purpose: purpose,
         deal_id: dealId,
         title: title
       })
     });
     const data = await res.json();
     if (data.status === "PENDING" && data.invoice_id) {
-      if (btnEl) btnEl.parentElement.innerHTML = `<div class="text-xs text-cyan-300 font-semibold py-2">📱 STK Push sent to ${phone}. Enter your M-Pesa PIN...</div>`;
-      pollInvoice(data.invoice_id);
+      if (btnEl) btnEl.innerHTML = `📱 Enter PIN on ${phone}...`;
+      pollInvoice(data.invoice_id, purpose, btnEl, origText);
     } else {
       alert("STK Push Error: " + JSON.stringify(data));
-      if (btnEl) { btnEl.innerText = "Retry M-Pesa"; btnEl.disabled = false; }
+      if (btnEl) { btnEl.innerHTML = origText; btnEl.disabled = false; }
     }
   } catch (e) {
     alert("Payment request failed: " + e);
-    if (btnEl) btnEl.disabled = false;
+    if (btnEl) { btnEl.innerHTML = origText; btnEl.disabled = false; }
   }
 }
 
-function pollInvoice(invoiceId) {
+function pollInvoice(invoiceId, purpose, btnEl = null, origText = "") {
   let tries = 0;
   const timer = setInterval(async () => {
     tries++;
-    if (tries > 30) clearInterval(timer);
+    if (tries > 30) {
+      clearInterval(timer);
+      if (btnEl) { btnEl.innerHTML = origText; btnEl.disabled = false; }
+    }
     try {
       const res = await fetch(`${API_BASE}/api/payment/check-status`, {
         method: "POST",
@@ -442,9 +559,14 @@ function pollInvoice(invoiceId) {
       const data = await res.json();
       if (data.state === "COMPLETE") {
         clearInterval(timer);
+        if (btnEl) { btnEl.innerHTML = origText; btnEl.disabled = false; }
         await refreshMe();
-        alert("🎉 M-Pesa Confirmed! +15 Aura minted and E2EE Wormhole spawned.");
-        if (data.wormhole_id) openWormhole(data.wormhole_id);
+        if (purpose === "COMPUTE_TOPUP") {
+          alert("⚡ M-Pesa Confirmed! Compute Credits added to your MuAI node.");
+        } else {
+          alert("🎉 M-Pesa Confirmed! +15 Aura minted and E2EE Wormhole spawned.");
+          if (data.wormhole_id) openWormhole(data.wormhole_id);
+        }
       }
     } catch (e) {}
   }, 2000);
@@ -466,7 +588,8 @@ async function openWormhole(whId) {
     if (m.sender_role === "arbiter") {
       return `<div class="p-2.5 rounded-lg border border-dashed border-emerald-500/40 text-emerald-300 font-mono text-[11px] text-center">${m.message}</div>`;
     }
-    return `<div class="p-3 rounded-xl bg-cyan-500/15 text-cyan-100 text-xs self-end ml-auto max-w-[85%]"><div class="text-[10px] text-cyan-300 font-bold mb-0.5">${m.sender_name}</div>${m.message}</div>`;
+    const isMe = currentUser && m.sender_name === currentUser.name;
+    return `<div class="p-3 rounded-xl ${isMe ? 'bg-cyan-500/15 text-cyan-100 self-end ml-auto' : 'bg-[#191d29] text-slate-100 self-start mr-auto'} text-xs max-w-[85%]"><div class="text-[10px] text-cyan-300 font-bold mb-0.5">${m.sender_name}</div>${m.message}</div>`;
   }).join("");
 
   document.getElementById("wormhole-drawer").classList.remove("hidden");
@@ -521,6 +644,7 @@ window.addEventListener("load", () => {
     document.getElementById("auth-view").classList.add("hidden");
     document.getElementById("app-shell").classList.remove("hidden");
     refreshMe();
+    loadChatHistory();
     loadFeed("all");
     loadLeaderboard();
   }
