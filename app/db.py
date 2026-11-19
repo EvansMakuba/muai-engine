@@ -23,7 +23,7 @@ def init_pg_db():
     with conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-        # 1. Multi-User Sovereign Nodes
+        # 1. Multi-User Sovereign Nodes (100 trial credits = ~2 turns)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
@@ -35,11 +35,12 @@ def init_pg_db():
             aura INTEGER DEFAULT 100,
             battery INTEGER DEFAULT 85,
             escrow_kes NUMERIC(12, 2) DEFAULT 0.00,
-            compute_credits INTEGER DEFAULT 5000,
+            compute_credits INTEGER DEFAULT 100,
             persona_vector JSONB DEFAULT '{"O":0.5,"C":0.7,"E":0.5,"A":0.6,"R":0.4}'::jsonb,
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
         """)
+        cur.execute("ALTER TABLE users ALTER COLUMN compute_credits SET DEFAULT 100;")
 
         # 2. Seeding Challenge: Academic Papers & Notes
         cur.execute("""
@@ -57,7 +58,7 @@ def init_pg_db():
         );
         """)
 
-        # 3. pgvector Chunks (768-dim Gemini embeddings + HNSW cosine index)
+        # 3. pgvector Academic Chunks
         cur.execute("""
         CREATE TABLE IF NOT EXISTS document_chunks (
             id SERIAL PRIMARY KEY,
@@ -73,7 +74,34 @@ def init_pg_db():
         ON document_chunks USING hnsw (embedding vector_cosine_ops);
         """)
 
-        # 4. MyHuman Agent Network Feed & Negotiation Threads
+        # 4. O(1) Constant-Token Episodic User Memory
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_memories (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+            memory_text TEXT NOT NULL,
+            embedding VECTOR(768),
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_user_memories_embedding
+        ON user_memories USING hnsw (embedding vector_cosine_ops);
+        """)
+
+        # 5. Full Chat Audit Logs (Observability + Anti-Abuse)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_logs (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+            user_message TEXT NOT NULL,
+            ai_reply TEXT NOT NULL,
+            credits_used INTEGER DEFAULT 50,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+
+        # 6. MyHuman Agent Network Feed & Negotiation Threads
         cur.execute("""
         CREATE TABLE IF NOT EXISTS posts (
             id TEXT PRIMARY KEY,
@@ -100,7 +128,7 @@ def init_pg_db():
         );
         """)
 
-        # 5. Hash-Chained Immutable Ledger
+        # 7. Hash-Chained Immutable Ledger
         cur.execute("""
         CREATE TABLE IF NOT EXISTS ledger (
             id SERIAL PRIMARY KEY,
@@ -114,7 +142,7 @@ def init_pg_db():
         );
         """)
 
-        # 6. IntaSend Idempotency Registry
+        # 8. IntaSend Idempotency Registry
         cur.execute("""
         CREATE TABLE IF NOT EXISTS processed_invoices (
             invoice_id TEXT PRIMARY KEY,
@@ -125,7 +153,7 @@ def init_pg_db():
         );
         """)
 
-        # 7. ADK 2.0 JSONB Session Storage (supports node_info & output fields cleanly)
+        # 9. ADK 2.0 JSONB Session Storage
         cur.execute("""
         CREATE TABLE IF NOT EXISTS adk_sessions (
             session_id TEXT PRIMARY KEY,
@@ -136,10 +164,9 @@ def init_pg_db():
         );
         """)
 
-        # Seed Demo Lead Node ('kevin')
         cur.execute("""
-        INSERT INTO users (id, email, name, is_verified_student, aura, battery, escrow_kes)
-        VALUES ('kevin', 'kevin@students.mu.ac.ke', 'Kevin M.', TRUE, 4310, 85, 3850.00)
+        INSERT INTO users (id, email, name, is_verified_student, aura, battery, escrow_kes, compute_credits)
+        VALUES ('kevin', 'kevin@students.mu.ac.ke', 'Kevin M.', TRUE, 4310, 85, 3850.00, 5000)
         ON CONFLICT (id) DO NOTHING;
         """)
 
