@@ -198,7 +198,7 @@ async function allocateEscrowToCompute() {
   }
 }
 
-async function payFromWallet(dealId, amount, title, counterparty, peerUserId, btnEl) {
+async function payFromWallet(dealId, amount, title, counterparty, peerUserId, postId, btnEl) {
   const orig = btnEl.innerHTML;
   btnEl.innerText = "Locking...";
   btnEl.disabled = true;
@@ -211,13 +211,15 @@ async function payFromWallet(dealId, amount, title, counterparty, peerUserId, bt
         deal_id: dealId,
         title: title,
         counterparty: counterparty,
-        peer_user_id: peerUserId
+        peer_user_id: peerUserId,
+        post_id: postId
       })
     });
     const data = await res.json();
     if (res.ok) {
       btnEl.parentElement.innerHTML = `<div class="text-xs text-emerald-400 font-bold py-2">✓ Locked KES ${amount} from Wallet (+15 Aura)</div>`;
       await refreshMe();
+      await loadFeed("all");
       if (data.wormhole_id) openWormhole(data.wormhole_id);
     } else {
       alert(data.detail || "Wallet payment failed.");
@@ -255,13 +257,13 @@ function renderMissionControlCard() {
     <div class="bg-[#131620] border border-white/10 rounded-2xl p-5">
       <div class="text-xs font-mono text-cyan-400 mb-2">[MISSION CONTROL • MOI UNIVERSITY NODE]</div>
       <p class="text-sm text-slate-200 leading-relaxed mb-4">
-        Your personal <strong>MuAI</strong> orchestrator is active. Upload a past paper for <strong>+25 Aura</strong>, or test real peer deals with other students!
+        Your personal <strong>MuAI</strong> agent is active. Sell an item, buy supplies, or ask academic questions.
       </p>
       <div class="flex flex-wrap gap-2">
-        <button onclick="sendQuickPrompt('Explain Faraday Law from my PHY 211 notes')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">📚 Explain PHY 211 Faraday Law</button>
-        <button onclick="sendQuickPrompt('I need a Casio calculator for my CAT today under 1000 KES')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🧮 Buy Casio fx-82MS (&lt;1k KES)</button>
-        <button onclick="sendQuickPrompt('I need some fries and a soda delivered to Hostel B')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🍟 Order Fries &amp; Soda</button>
-        <button onclick="sendQuickPrompt('Check my Aura score, compute credits, and recent ledger')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🛡️ Check My Aura &amp; Credits</button>
+        <button onclick="sendQuickPrompt('I have a Casio fx-82MS calculator that I want to sell for KES 900')" class="text-xs px-3 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 font-semibold cursor-pointer">📦 Sell Casio fx-82MS (KES 900)</button>
+        <button onclick="sendQuickPrompt('I need a Casio fx-82MS calculator under 1000 KES')" class="text-xs px-3 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-300 font-semibold cursor-pointer">🧮 Buy Casio fx-82MS</button>
+        <button onclick="sendQuickPrompt('Explain Faraday Law from my PHY 211 notes')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">📚 Explain Faraday Law</button>
+        <button onclick="sendQuickPrompt('Check my Aura score, compute credits, and recent ledger')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🛡️ Check Status</button>
       </div>
     </div>
   `;
@@ -287,7 +289,6 @@ function sendQuickPrompt(text) {
   sendChatStream();
 }
 
-// Real-Time Token Streaming with Staged File Support
 async function sendChatStream() {
   const input = document.getElementById("chat-input");
   const message = input.value.trim();
@@ -389,8 +390,26 @@ function renderActionWidget(w, container) {
   const safeTitle = (w.title || "").replace(/'/g, "");
   const safeCounterparty = (w.counterparty || "").replace(/'/g, "");
   const peerUserId = w.peer_user_id || "";
+  const postId = w.post_id || "";
 
-  if (w.type === "COMPUTE_TOPUP") {
+  if (w.type === "SELLER_LISTED") {
+    // Seller View: Listing is active in the order book. NO PAYMENT REQUIRED!
+    container.innerHTML = `
+      <div class="mt-4 bg-[#181c28] border border-emerald-500/40 rounded-xl p-4">
+        <div class="font-display font-bold text-emerald-300 text-sm mb-1">📦 ${w.title}</div>
+        <p class="text-xs text-slate-300 mb-2">Listed on MyHuman at KES ${w.display_price_kes}. Your node is listening for buyer bids.</p>
+        <div class="text-[11px] font-mono text-cyan-400">Status: Listening on Order Book (Sellers pay 0 KES)</div>
+      </div>
+    `;
+  } else if (w.type === "SELLER_MATCH") {
+    container.innerHTML = `
+      <div class="mt-4 bg-[#181c28] border border-cyan-500/40 rounded-xl p-4">
+        <div class="font-display font-bold text-cyan-300 text-sm mb-1">🤝 ${w.title}</div>
+        <p class="text-xs text-slate-300 mb-2">Buyer <strong>${w.counterparty}</strong> matched at KES ${w.display_price_kes}.</p>
+        <div class="text-[11px] font-mono text-amber-300">Awaiting Buyer M-Pesa Escrow Lock...</div>
+      </div>
+    `;
+  } else if (w.type === "COMPUTE_TOPUP") {
     container.innerHTML = `
       <div class="mt-4 bg-[#181c28] border border-amber-400/40 rounded-xl p-4">
         <div class="font-display font-bold text-amber-300 text-sm mb-2">⚡ ${w.title}</div>
@@ -402,14 +421,15 @@ function renderActionWidget(w, container) {
       </div>
     `;
   } else if (w.type === "SPNE_DEAL") {
+    // Buyer View: Needs to pay or lock from wallet!
     const hasWallet = currentUser && (currentUser.wallet_kes >= w.price_kes);
     container.innerHTML = `
       <div class="mt-4 bg-[#181c28] border border-cyan-400/40 rounded-xl p-4">
         <div class="font-display font-bold text-cyan-300 text-sm mb-2">🤝 ${w.title}</div>
-        <div class="text-xs text-slate-400 flex justify-between mb-1"><span>Counterparty</span><span class="text-white font-medium">${w.counterparty}</span></div>
+        <div class="text-xs text-slate-400 flex justify-between mb-1"><span>Seller</span><span class="text-white font-medium">${w.counterparty}</span></div>
         <div class="text-xs text-slate-400 flex justify-between mb-3"><span>SPNE Price</span><span class="text-emerald-400 font-bold">KES ${w.display_price_kes} (Demo: KES ${w.price_kes})</span></div>
         <div class="flex flex-wrap gap-2">
-          ${hasWallet ? `<button onclick="payFromWallet('${w.deal_id}', ${w.price_kes}, '${safeTitle}', '${safeCounterparty}', '${peerUserId}', this)" class="flex-1 py-2 px-3 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-bold text-xs cursor-pointer">Lock from Wallet (KES ${w.price_kes})</button>` : ''}
+          ${hasWallet ? `<button onclick="payFromWallet('${w.deal_id}', ${w.price_kes}, '${safeTitle}', '${safeCounterparty}', '${peerUserId}', '${postId}', this)" class="flex-1 py-2 px-3 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-bold text-xs cursor-pointer">Lock from Wallet (KES ${w.price_kes})</button>` : ''}
           <button onclick="openMpesaModal('${w.deal_id}', ${w.price_kes}, '${safeTitle}', 'ESCROW_LOCK', '${peerUserId}')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">
             Pay via M-Pesa (KES ${w.price_kes})
           </button>
@@ -483,7 +503,7 @@ async function loadFeed(category = "all", btnEl = null) {
           <span>•</span>
           <span>${p.author_agent}</span>
           <span>•</span>
-          <span class="${p.status === 'CLAIMED' ? 'text-amber-400' : 'text-emerald-400'}">${p.status}</span>
+          <span class="${p.status === 'LISTED' ? 'text-amber-400' : 'text-emerald-400'}">${p.status}</span>
         </div>
         <h3 class="font-semibold text-sm text-white mb-1">${p.title}</h3>
         <p class="text-xs text-slate-400 line-clamp-2 mb-2">${p.body}</p>
@@ -499,10 +519,10 @@ async function openThread(postId) {
   const p = data.post;
 
   let claimBtn = "";
-  if (currentUser && p.author_user_id !== currentUser.id && p.status !== "CLAIMED") {
+  if (currentUser && p.author_user_id !== currentUser.id && p.status === "LISTED") {
     claimBtn = `
-      <button onclick="claimPeerPost('${p.id}')" class="mt-3 w-full py-2.5 px-4 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer transition">
-        🤝 Claim Task &amp; Open Shared E2EE Wormhole
+      <button onclick="openMpesaModal('post-${p.id}', ${p.price_kes || 10}, '${p.title.replace(/'/g, '')}', 'ESCROW_LOCK', '${p.author_user_id}')" class="mt-3 w-full py-2.5 px-4 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer transition">
+        🤝 Lock Escrow &amp; Buy from ${p.author_name} (KES ${p.price_kes || 10})
       </button>
     `;
   }
@@ -528,26 +548,10 @@ async function openThread(postId) {
       </div>
     `;
   });
-  html += `</div><div class="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-bold text-center">✓ SPNE Equilibrium Cleared &amp; Committed</div>`;
+  html += `</div><div class="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-bold text-center">✓ Double-Auction Order Book Active</div>`;
 
   document.getElementById("thread-modal-body").innerHTML = html;
   document.getElementById("thread-modal").classList.remove("hidden");
-}
-
-async function claimPeerPost(postId) {
-  const res = await fetch(`${API_BASE}/api/feed/${postId}/fulfill`, {
-    method: "POST",
-    headers: authHeaders()
-  });
-  const data = await res.json();
-  if (res.ok) {
-    document.getElementById("thread-modal").classList.add("hidden");
-    await refreshMe();
-    await loadFeed("all");
-    if (data.wormhole_id) openWormhole(data.wormhole_id);
-  } else {
-    alert(data.detail || "Could not claim task.");
-  }
 }
 
 // ---------------- LEADERBOARD ----------------
@@ -629,7 +633,7 @@ async function submitMpesaModal() {
       statusBox.className = "rounded-xl p-4 text-sm border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 space-y-3";
       statusBox.innerHTML = `
         <div>📱 <strong>PIN Prompt sent to ${phone}</strong>. Enter your M-Pesa PIN on your phone.</div>
-        <button onclick="checkMpesaNow('${data.invoice_id}', '${pendingMpesaTx.purpose}')" class="w-full py-2 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer transition">
+        <button onclick="checkMpesaNow('${data.invoice_id}', '${pendingMpesaTx.purpose}')" class="w-full py-2.5 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer transition">
           ⚡ I Have Entered PIN — Verify Now
         </button>
       `;
@@ -725,7 +729,6 @@ async function openWormhole(whId) {
   await fetchWormholeMessages(whId);
   document.getElementById("wormhole-drawer").classList.remove("hidden");
 
-  // Real-time two-way sync: poll messages every 2.5s while open
   if (whSyncTimer) clearInterval(whSyncTimer);
   whSyncTimer = setInterval(() => {
     if (activeWormholeId) fetchWormholeMessages(activeWormholeId);
@@ -739,6 +742,17 @@ async function fetchWormholeMessages(whId) {
     const data = await res.json();
     document.getElementById("wh-title").innerText = data.wormhole.title;
     document.getElementById("wh-escrow").innerText = `Escrow: KES ${data.wormhole.escrow_kes}`;
+
+    const isBuyer = currentUser && data.wormhole.user_id === currentUser.id;
+    const releaseBtn = document.getElementById("wh-release-btn");
+    if (releaseBtn) {
+      if (isBuyer) {
+        releaseBtn.classList.remove("hidden");
+        releaseBtn.innerText = "✓ Verify Delivery & Release Escrow to Peer (+20 Aura)";
+      } else {
+        releaseBtn.classList.add("hidden"); // Seller cannot release their own escrow!
+      }
+    }
 
     document.getElementById("wh-messages").innerHTML = (data.messages || []).map(m => {
       if (m.sender_role === "arbiter" || m.sender_id === "arbiter") {
@@ -774,10 +788,11 @@ async function releaseCurrentWormhole() {
     method: "POST",
     headers: authHeaders()
   });
+  const data = await res.json();
   if (res.ok) {
     closeWormhole();
     await refreshMe();
-    alert("✓ Escrow Released! Funds transferred directly to peer seller wallet (+20 Aura).");
+    alert(`✓ Escrow Released! KES ${data.settled_kes} transferred directly to the seller's Available Wallet (+20 Aura).`);
   }
 }
 

@@ -26,7 +26,7 @@ from openai import OpenAI
 load_dotenv("/opt/muai-engine/.env")
 load_dotenv(".env")
 
-app = FastAPI(title="MuAI Sovereign Epistemic Engine", version="5.0.0")
+app = FastAPI(title="MuAI Sovereign Epistemic Engine", version="6.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,7 +52,7 @@ ai_client = OpenAI(
 
 _rate_buckets = defaultdict(deque)
 
-def check_rate_limit(user_id: str, max_calls: int = 12, window_sec: int = 60):
+def check_rate_limit(user_id: str, max_calls: int = 15, window_sec: int = 60):
     now = time.time()
     q = _rate_buckets[user_id]
     while q and now - q[0] > window_sec:
@@ -65,6 +65,11 @@ def init_all():
     init_pg_db()
     conn = get_conn()
     with conn.cursor() as cur:
+        # Extend posts table to distinguish BIDS (demand) from ASKS (supply)
+        cur.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS intent_type TEXT DEFAULT 'BID';")
+        cur.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS price_kes NUMERIC(12, 2) DEFAULT 0.00;")
+        cur.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS item_name TEXT DEFAULT '';")
+        
         cur.execute("""
         CREATE TABLE IF NOT EXISTS wormholes (
             id TEXT PRIMARY KEY,
@@ -115,6 +120,7 @@ class WalletEscrowRequest(BaseModel):
     title: str
     counterparty: Optional[str] = "Verified Peer Agent"
     peer_user_id: Optional[str] = None
+    post_id: Optional[str] = None
 
 class STKPushRequest(BaseModel):
     phone_number: str
@@ -133,7 +139,7 @@ class WormholeMsgRequest(BaseModel):
 # ----------------- AUTH & CONFIG -----------------
 @app.get("/health")
 async def health():
-    return {"status": "operational", "node": "Moi-University-Node-01", "p2p_swarm": "active"}
+    return {"status": "operational", "node": "Moi-University-Node-01", "kernel": "Double-Auction-v6"}
 
 @app.get("/api/config")
 async def get_config():
@@ -237,7 +243,7 @@ async def get_leaderboard():
     conn.close()
     return {"leaderboard": leaders, "recent_documents": recent_docs}
 
-# ----------------- REAL-TIME CHAT STREAM WITH MULTI-MODAL ATTACHMENT -----------------
+# ----------------- REAL-TIME CHAT STREAMING & DOUBLE-AUCTION MATCHMAKER -----------------
 @app.get("/api/chat/history")
 async def get_chat_history(user_id: str = Depends(decode_session_token)):
     conn = get_conn()
@@ -257,21 +263,18 @@ async def chat_stream(
     file: Optional[UploadFile] = File(None),
     user_id: str = Depends(decode_session_token)
 ):
-    """
-    Real-time Token-by-Token Streaming Endpoint (like ChatGPT).
-    Supports optional staged file attachments (PDF/Images) + message simultaneously.
-    """
-    check_rate_limit(user_id, max_calls=12, window_sec=60)
+    check_rate_limit(user_id, max_calls=15, window_sec=60)
     clean_msg = message.strip()
 
     conn = get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT name, compute_credits FROM users WHERE id = %s;", (user_id,))
+        cur.execute("SELECT name, compute_credits, aura FROM users WHERE id = %s;", (user_id,))
         user_row = cur.fetchone()
         if not user_row:
             conn.close()
             raise HTTPException(status_code=404, detail="User not found")
         user_name = user_row["name"]
+        user_aura = user_row["aura"]
         credits = int(user_row["compute_credits"])
 
         if credits < 50:
@@ -308,42 +311,179 @@ async def chat_stream(
     recalled_memories = recall_relevant_memories(user_id, clean_msg, top_k=3)
     memory_context = "\n".join(f"- {m}" for m in recalled_memories) if recalled_memories else "None"
 
-    # Step 3: P2P Agent Swarm Discovery (Checking REAL listings from John, Meshack, or other students)
-    p2p_candidate = None
+    # Step 3: Intent Classification via DeepSeek (ASK vs BID vs QUERY)
+    classifier_prompt = f"""
+    Analyze this message from student "{user_name}": "{clean_msg}"
+    Classify into strict JSON:
+    {{
+       "intent_type": "ASK" (if user is SELLING, OFFERING, or PROVIDING an item/service) | "BID" (if user WANTS to BUY, HIRE, ORDER, or FIND something) | "QUERY" (if user asks an academic question, syllabus, notes, timetable),
+       "item_or_service": "exact item or service name (e.g. Casio fx-82MS, Fries & Soda, Physics notes)",
+       "price_kes": numeric price mentioned or estimated (e.g. 900),
+       "category": "c/ComradeCart" | "c/CampusServices" | "c/Academics" | "c/Hostels" | "c/DarkMarket",
+       "summary": "1 sentence explanation"
+    }}
+    Return ONLY raw JSON.
+    """
+    
+    intent_data = {"intent_type": "QUERY", "item_or_service": "", "price_kes": 0, "category": "c/ComradeCart"}
+    try:
+        c_res = ai_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": classifier_prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.1
+        )
+        intent_data = json.loads(c_res.choices[0].message.content.strip())
+    except Exception:
+        pass
+
+    intent_type = intent_data.get("intent_type", "QUERY")
+    item = intent_data.get("item_or_service") or "Item"
+    price = float(intent_data.get("price_kes") or 500)
+    category = intent_data.get("category") or "c/ComradeCart"
+
+    # Step 4: The Continuous Double-Auction Kernel Execution
+    action_widget = None
+    system_execution_notes = ""
+
     conn = get_conn()
     with conn.cursor() as cur:
-        # Check if another user listed something matching the user's intent keywords
-        cur.execute("""
-        SELECT p.*, u.name AS seller_name, u.aura AS seller_aura
-        FROM posts p
-        JOIN users u ON p.author_user_id = u.id
-        WHERE p.author_user_id != %s AND p.status = 'OPEN'
-        ORDER BY p.created_at DESC LIMIT 10;
-        """, (user_id,))
-        open_posts = [dict(r) for r in cur.fetchall()]
+        if intent_type == "ASK":
+            # SELLER (Supply): List on MyHuman, monitor for Bids. ZERO PAYMENT REQUIRED!
+            post_id = f"post-{uuid.uuid4().hex[:6]}"
+            agent_label = f"Agent #{user_id[-4:].upper()} ({user_name})"
+            title = f"SELL: {item} ({int(price)} KES)"
+            cur.execute("""
+            INSERT INTO posts (id, category, author_user_id, author_agent, author_name, title, body, status, intent_type, price_kes, item_name)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'LISTED', 'ASK', %s, %s);
+            """, (post_id, category, user_id, agent_label, user_name, title, f"{user_name} listed {item} for sale at KES {int(price)}. Agent listening for buyer bids.", price, item))
+            
+            # Check if any buyer BID is already waiting in the order book!
+            cur.execute("""
+            SELECT p.*, u.name as buyer_name, u.aura as buyer_aura 
+            FROM posts p JOIN users u ON p.author_user_id = u.id
+            WHERE p.intent_type = 'BID' AND p.status = 'OPEN' AND p.author_user_id != %s
+            AND (p.title ILIKE %s OR p.item_name ILIKE %s)
+            ORDER BY p.price_kes DESC LIMIT 1;
+            """, (user_id, f"%{item[:6]}%", f"%{item[:6]}%"))
+            waiting_bid = cur.fetchone()
+
+            if waiting_bid:
+                # Match found immediately!
+                cur.execute("UPDATE posts SET status = 'MATCHED' WHERE id = %s;", (post_id,))
+                cur.execute("UPDATE posts SET status = 'MATCHED' WHERE id = %s;", (waiting_bid["id"],))
+                system_execution_notes = f"Matched waiting buyer {waiting_bid['buyer_name']} from the order book! Initialized negotiation."
+                action_widget = {
+                    "type": "SELLER_MATCH",
+                    "title": f"Buyer Found: {item}",
+                    "counterparty": f"{waiting_bid['buyer_name']} (Aura: {waiting_bid['buyer_aura']})",
+                    "display_price_kes": int(price),
+                    "action": "AWAITING_BUYER_ESCROW",
+                    "peer_user_id": waiting_bid["author_user_id"]
+                }
+            else:
+                system_execution_notes = f"Listed {item} on {category} at KES {int(price)}. Node is actively watching for buyer bids."
+                action_widget = {
+                    "type": "SELLER_LISTED",
+                    "title": f"Active Listing: {item}",
+                    "counterparty": "MyHuman Order Book",
+                    "display_price_kes": int(price),
+                    "action": "LISTED"
+                }
+
+        elif intent_type == "BID":
+            # BUYER (Demand): Search for matching ASKS from other students (John, Meshack, etc.)
+            cur.execute("""
+            SELECT p.*, u.name as seller_name, u.aura as seller_aura 
+            FROM posts p JOIN users u ON p.author_user_id = u.id
+            WHERE p.intent_type = 'ASK' AND p.status = 'LISTED' AND p.author_user_id != %s
+            AND (p.title ILIKE %s OR p.item_name ILIKE %s)
+            ORDER BY p.price_kes ASC LIMIT 1;
+            """, (user_id, f"%{item[:6]}%", f"%{item[:6]}%"))
+            matching_ask = cur.fetchone()
+
+            if matching_ask:
+                seller_id = matching_ask["author_user_id"]
+                seller_name = matching_ask["seller_name"]
+                seller_aura = matching_ask["seller_aura"]
+                seller_price = float(matching_ask["price_kes"])
+                post_id = matching_ask["id"]
+
+                # SPNE Clearing: Settle at agreed price
+                cleared_price = min(price, seller_price)
+                cur.execute("UPDATE posts SET status = 'SPNE Cleared' WHERE id = %s;", (post_id,))
+                
+                # Add negotiation trace to thread
+                cur.execute("""
+                INSERT INTO comments (id, post_id, agent_id, aura_score, comment_text, sys_action)
+                VALUES 
+                (%s, %s, %s, %s, %s, '[SPNE Cleared: Matched in Order Book]'),
+                (%s, %s, %s, %s, 'Terms accepted. Escrow ready for human authorization.', '[Contract Sealed]');
+                """, (
+                    f"cm-{uuid.uuid4().hex[:6]}", post_id, f"Agent #{user_id[-4:].upper()} ({user_name})", user_aura,
+                    f"My human placed bid for KES {int(cleared_price)}. Terms match inventory.",
+                    f"cm-{uuid.uuid4().hex[:6]}", post_id, f"Agent #{seller_id[-4:].upper()} ({seller_name})", seller_aura
+                ))
+
+                system_execution_notes = f"Matched active listing from {seller_name} ({category}) at KES {int(cleared_price)}."
+                action_widget = {
+                    "type": "SPNE_DEAL",
+                    "title": f"Contract Ready: {item}",
+                    "counterparty": f"{seller_name} (Aura: {seller_aura})",
+                    "peer_user_id": seller_id,
+                    "price_kes": 10.0,  # 10 KES demo M-Pesa trigger
+                    "display_price_kes": int(cleared_price),
+                    "deal_id": f"deal-{uuid.uuid4().hex[:6]}",
+                    "post_id": post_id
+                }
+            else:
+                # No peer seller exists yet -> Post BID to order book & provide simulated vendor fallback
+                post_id = f"post-{uuid.uuid4().hex[:6]}"
+                agent_label = f"Agent #{user_id[-4:].upper()} ({user_name})"
+                title = f"BUY INTENT: {item} (<{int(price)} KES)"
+                cur.execute("""
+                INSERT INTO posts (id, category, author_user_id, author_agent, author_name, title, body, status, intent_type, price_kes, item_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'OPEN', 'BID', %s, %s);
+                """, (post_id, category, user_id, agent_label, user_name, title, f"Looking to acquire {item}. Max budget: KES {int(price)}.", price, item))
+
+                # Student vendor simulation fallback so demo always works
+                cleared_price = max(50.0, round(price * 0.9, -1))
+                counterparty = "Agent #14 (Student Vendor)"
+                action_widget = {
+                    "type": "SPNE_DEAL",
+                    "title": f"Contract Ready: {item}",
+                    "counterparty": f"{counterparty} (Aura: 3450)",
+                    "peer_user_id": "vendor-sim",
+                    "price_kes": 10.0,
+                    "display_price_kes": int(cleared_price),
+                    "deal_id": f"deal-{uuid.uuid4().hex[:6]}",
+                    "post_id": post_id
+                }
+                system_execution_notes = f"No student Ask matched immediately. Broadcasted Bid to {category} and settled fallback contract with {counterparty} at KES {int(cleared_price)}."
+
+    conn.commit()
     conn.close()
 
+    # Step 5: Stream the Executive AI Response
     system_prompt = f"""
-    You are MuAI, the autonomous campus agent for {user_name} at Moi University.
-    RECALLED EPISODIC MEMORIES (from pgvector):
+    You are MuAI, the autonomous coordinator for {user_name} at Moi University.
+    RECALLED VECTOR MEMORIES:
     {memory_context}
     {attached_doc_context}
 
-    ACTIVE PEER LISTINGS IN POSTGRESQL:
-    {json.dumps([{ 'id': p['id'], 'category': p['category'], 'seller': p['seller_name'], 'seller_id': p['author_user_id'], 'aura': p['seller_aura'], 'title': p['title'], 'body': p['body'] } for p in open_posts])}
+    MARKET KERNEL STATUS:
+    Intent Classified: {intent_type}
+    Kernel Action: {system_execution_notes}
 
     RULES:
-    1. If the user is looking to BUY or HIRE something that matches an active peer listing above, select that peer and announce the deal!
-    2. If no peer listing matches, state that you have broadcasted the intent to the right c/ community and settled an SPNE contract with a student vendor.
-    3. If asked an academic question, cite notes or course formulas directly.
-    4. Keep answers concise, factual, and executive (under 4 sentences).
+    1. If the user is SELLING (ASK), confirm you listed their item on {category} at KES {int(price)} and that their agent is listening for bids. Emphasize that sellers PAY NOTHING.
+    2. If the user is BUYING (BID), announce the matched deal cleanly and state that the escrow payment card is ready.
+    3. If academic question, answer directly citing course notes and formulas.
+    4. Keep tone executive, concise, and under 4 sentences.
     """
 
-    # Step 4: Stream response token-by-token
     async def response_streamer() -> AsyncGenerator[str, None]:
         full_reply = ""
-        action_widget = None
-
         try:
             stream = ai_client.chat.completions.create(
                 model="deepseek-chat",
@@ -362,44 +502,9 @@ async def chat_stream(
                     yield f"data: {json.dumps({'chunk': token})}\n\n"
                     await asyncio.sleep(0.01)
 
-            # Detect if a deal was struck to yield action widget
-            lower = clean_msg.lower()
-            if any(k in lower for k in ["calc", "casio", "fx82", "fx-82"]):
-                # Look for John or peer seller in open posts
-                seller = next((p for p in open_posts if "casio" in p["title"].lower() or "calc" in p["title"].lower()), None)
-                peer_uid = seller["author_user_id"] if seller else "john"
-                seller_name = seller["seller_name"] if seller else "John Ochieng"
-                seller_aura = seller["seller_aura"] if seller else 3450
-
-                action_widget = {
-                    "type": "SPNE_DEAL",
-                    "title": "Contract Ready: Casio fx-82MS Scientific Calculator",
-                    "counterparty": f"{seller_name} (Aura: {seller_aura})",
-                    "peer_user_id": peer_uid,
-                    "price_kes": 10.0,
-                    "display_price_kes": 900,
-                    "deal_id": f"calc-{uuid.uuid4().hex[:6]}"
-                }
-            elif any(k in lower for k in ["fries", "soda", "food", "lunch"]):
-                seller = next((p for p in open_posts if "fries" in p["title"].lower() or "food" in p["title"].lower()), None)
-                peer_uid = seller["author_user_id"] if seller else "meshack"
-                seller_name = seller["seller_name"] if seller else "Meshack Ajwang"
-                seller_aura = seller["seller_aura"] if seller else 4120
-
-                action_widget = {
-                    "type": "SPNE_DEAL",
-                    "title": "Contract Ready: Fries & Soda Delivery",
-                    "counterparty": f"{seller_name} (Aura: {seller_aura})",
-                    "peer_user_id": peer_uid,
-                    "price_kes": 10.0,
-                    "display_price_kes": 200,
-                    "deal_id": f"food-{uuid.uuid4().hex[:6]}"
-                }
-
             if action_widget:
                 yield f"data: {json.dumps({'action_widget': action_widget})}\n\n"
 
-            # Persist memory to pgvector & audit log
             store_turn_memory(user_id, clean_msg, full_reply, credits_used=50)
 
         except Exception as e:
@@ -410,7 +515,7 @@ async def chat_stream(
 
     return StreamingResponse(response_streamer(), media_type="text/event-stream")
 
-# ----------------- REAL P2P WORMHOLES & REAL ESCROW SETTLEMENT -----------------
+# ----------------- WORMHOLES & REAL ESCROW SETTLEMENT -----------------
 def spawn_wormhole_sync(user_id: str, peer_user_id: Optional[str], title: str, counterparty: str, amount_kes: float) -> str:
     wh_id = f"wh-{uuid.uuid4().hex[:6]}"
     conn = get_conn()
@@ -422,7 +527,7 @@ def spawn_wormhole_sync(user_id: str, peer_user_id: Optional[str], title: str, c
         cur.execute("""
         INSERT INTO wormhole_messages (wormhole_id, sender_id, sender_name, message)
         VALUES (%s, 'arbiter', 'Arbiter Daemon', %s);
-        """, (wh_id, f"E2EE Shared Edge active. KES {amount_kes:.0f} locked in smart escrow. Coordinate handoff here."))
+        """, (wh_id, f"E2EE Shared Edge active. KES {amount_kes:.0f} locked in escrow. Handover details can be coordinated here."))
     conn.commit()
     conn.close()
     return wh_id
@@ -465,8 +570,8 @@ async def send_wormhole_message(wh_id: str, req: WormholeMsgRequest, user_id: st
 @app.post("/api/wormholes/{wh_id}/release")
 async def release_wormhole(wh_id: str, user_id: str = Depends(decode_session_token)):
     """
-    Settles escrow: Decrements buyer's locked_escrow_kes,
-    credits the peer seller's wallet_kes directly, and mints +20 Aura to both!
+    Settles escrow: Deducts locked_escrow from buyer,
+    credits the peer seller's real wallet_kes, and awards +20 Aura!
     """
     conn = get_conn()
     with conn.cursor() as cur:
@@ -478,7 +583,7 @@ async def release_wormhole(wh_id: str, user_id: str = Depends(decode_session_tok
         cur.execute("UPDATE wormholes SET status = 'COLLAPSED' WHERE id = %s;", (wh_id,))
         cur.execute("""
         INSERT INTO wormhole_messages (wormhole_id, sender_id, sender_name, message)
-        VALUES (%s, 'arbiter', 'Arbiter Daemon', 'Handshake confirmed. Escrow funds transferred to peer wallet.');
+        VALUES (%s, 'arbiter', 'Arbiter Daemon', 'Delivery confirmed. Escrow transferred to seller wallet.');
         """, (wh_id,))
     conn.commit()
     conn.close()
@@ -487,9 +592,7 @@ async def release_wormhole(wh_id: str, user_id: str = Depends(decode_session_tok
     buyer_id = wh["user_id"]
     seller_id = wh["peer_user_id"]
 
-    # Unlock buyer's escrow
-    commit_ledger(buyer_id, f"Escrow Released: {wh['title']}", 20.0, wallet_delta=0.0, escrow_delta=-escrow_amt)
-    # Credit seller's real Available Wallet!
+    commit_ledger(buyer_id, f"Escrow Settled: {wh['title']}", 20.0, wallet_delta=0.0, escrow_delta=-escrow_amt)
     if seller_id and seller_id != buyer_id:
         commit_ledger(seller_id, f"P2P Escrow Received: {wh['title']}", 20.0, wallet_delta=escrow_amt, escrow_delta=0.0)
 
@@ -506,10 +609,12 @@ async def pay_escrow_from_wallet(req: WalletEscrowRequest, user_id: str = Depend
         if not row or float(row["wallet_kes"]) < req.amount_kes:
             conn.close()
             raise HTTPException(status_code=400, detail="Insufficient Wallet balance. Deposit via M-Pesa first.")
+        if req.post_id:
+            cur.execute("UPDATE posts SET status = 'ESCROW_LOCKED' WHERE id = %s;", (req.post_id,))
     conn.commit()
     conn.close()
 
-    commit_ledger(user_id, f"Locked Escrow from Wallet: {req.title}", 15.0, wallet_delta=-req.amount_kes, escrow_delta=req.amount_kes)
+    commit_ledger(user_id, f"Locked Escrow: {req.title}", 15.0, wallet_delta=-req.amount_kes, escrow_delta=req.amount_kes)
     wh_id = spawn_wormhole_sync(user_id, req.peer_user_id, req.title, req.counterparty, req.amount_kes)
     return {"status": "ESCROW_LOCKED", "wormhole_id": wh_id, "aura_minted": 15}
 
@@ -545,7 +650,7 @@ async def trigger_stk_push(req: STKPushRequest, user_id: str = Depends(decode_se
 
 @app.post("/api/payment/check-status")
 async def check_status(req: StatusCheckRequest):
-    # 1. Check local DB first (if webhook arrived, instant 10ms response!)
+    # 1. Local DB verification (Instant response if webhook already cleared!)
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM processed_invoices WHERE invoice_id = %s;", (req.invoice_id,))
@@ -559,7 +664,7 @@ async def check_status(req: StatusCheckRequest):
             return {"invoice_id": req.invoice_id, "state": "COMPLETE", "wormhole_id": wh["id"] if wh else None}
     conn.close()
 
-    # 2. Query IntaSend directly
+    # 2. Remote IntaSend Status Check
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{INTASEND_BASE_URL}/payment/status/",
@@ -634,7 +739,7 @@ async def get_feed(category: Optional[str] = None):
         for p in posts:
             cur.execute("SELECT COUNT(*) AS cnt FROM comments WHERE post_id = %s;", (p["id"],))
             p["comments_count"] = cur.fetchone()["cnt"]
-            if p["status"] in ("OPEN", "SPNE Cleared"): active_cnt += 1
+            if p["status"] in ("OPEN", "LISTED", "SPNE Cleared"): active_cnt += 1
     conn.close()
     return {"posts": posts, "active_count": active_cnt}
 
@@ -652,41 +757,18 @@ async def get_thread(post_id: str):
     conn.close()
     return {"post": dict(post), "comments": comments}
 
-@app.post("/api/feed/{post_id}/fulfill")
-async def fulfill_peer_post(post_id: str, user_id: str = Depends(decode_session_token)):
-    conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute("SELECT name, aura FROM users WHERE id = %s;", (user_id,))
-        claimer = cur.fetchone()
-        cur.execute("SELECT * FROM posts WHERE id = %s;", (post_id,))
-        post = cur.fetchone()
-        if not post or not claimer:
-            conn.close()
-            raise HTTPException(status_code=404, detail="Post not found")
-        if post["author_user_id"] == user_id:
-            conn.close()
-            raise HTTPException(status_code=400, detail="You cannot claim your own listing.")
+@app.post("/api/documents/upload")
+async def upload_academic_doc(file: UploadFile = File(...), user_id: str = Depends(decode_session_token)):
+    file_bytes = await file.read()
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File exceeds 10MB limit.")
 
-        cur.execute("UPDATE posts SET status = 'CLAIMED' WHERE id = %s;", (post_id,))
-        agent_label = f"Agent #{user_id[-4:].upper()} ({claimer['name']})"
-        cur.execute("""
-        INSERT INTO comments (id, post_id, agent_id, aura_score, comment_text, sys_action)
-        VALUES (%s, %s, %s, %s, %s, '[Peer Claim Accepted: Shared E2EE Wormhole Spawned]');
-        """, (f"cm-{uuid.uuid4().hex[:6]}", post_id, agent_label, claimer["aura"], f"My human ({claimer['name']}) has claimed this task. Wormhole active."))
-
-        wh_id = f"wh-{uuid.uuid4().hex[:6]}"
-        cur.execute("""
-        INSERT INTO wormholes (id, user_id, peer_user_id, title, counterparty, escrow_kes, status)
-        VALUES (%s, %s, %s, %s, %s, 0.00, 'ACTIVE');
-        """, (wh_id, post["author_user_id"], user_id, post["title"], f"{post['author_name']} ↔ {claimer['name']}"))
-
-        cur.execute("""
-        INSERT INTO wormhole_messages (wormhole_id, sender_id, sender_name, message)
-        VALUES (%s, 'arbiter', 'Arbiter Daemon', %s);
-        """, (wh_id, f"Shared Peer Wormhole active between {post['author_name']} and {claimer['name']}. Coordinate handoff here."))
-    conn.commit()
-    conn.close()
-    return {"status": "CLAIMED", "wormhole_id": wh_id}
+    result = await run_in_threadpool(
+        ingest_document, user_id, file_bytes, file.filename or "upload.txt", file.content_type or "application/octet-stream"
+    )
+    if not result.get("accepted"):
+        raise HTTPException(status_code=400, detail=result.get("reason", "Upload rejected"))
+    return result
 
 # ----------------- STATIC ASSETS -----------------
 static_dir = os.path.join(BASE_DIR, "static")
