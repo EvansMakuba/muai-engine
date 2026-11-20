@@ -4,6 +4,8 @@ let currentUser = null;
 let activeWormholeId = null;
 let pendingMpesaTx = null;
 let activePollTimer = null;
+let whSyncTimer = null;
+let stagedFile = null;
 
 function authHeaders(extra = {}) {
   return { ...extra, "Authorization": `Bearer ${authToken}` };
@@ -15,6 +17,22 @@ function formatMarkdown(text) {
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/`([^`]+)`/g, '<code class="px-1 py-0.5 rounded bg-white/10 text-cyan-300 text-xs">$1</code>')
     .replace(/\n/g, "<br>");
+}
+
+// ---------------- FILE STAGING IN CHAT COMPOSER ----------------
+function stageFileForChat(inputEl) {
+  const file = inputEl.files?.[0];
+  if (!file) return;
+  stagedFile = file;
+  document.getElementById("staged-file-name").innerText = file.name;
+  document.getElementById("staged-file-chip").classList.remove("hidden");
+  document.getElementById("chat-input").focus();
+}
+
+function clearStagedFile() {
+  stagedFile = null;
+  document.getElementById("chat-file-input").value = "";
+  document.getElementById("staged-file-chip").classList.add("hidden");
 }
 
 // ---------------- AUTHENTICATION ----------------
@@ -47,13 +65,13 @@ async function initGoogleSignIn() {
       { theme: "filled_black", size: "large", width: 320, text: "continue_with" }
     );
   } catch (e) {
-    console.warn("Google Sign-In init deferred:", e);
+    console.warn("Google Sign-In deferred:", e);
   }
 }
 
 async function loginDemo() {
   const pin = document.getElementById("demo-pin-input")?.value.trim() || "";
-  if (!pin) return alert("Enter your Stage PIN.");
+  if (!pin) return alert("Enter Stage PIN.");
   const res = await fetch(`${API_BASE}/api/auth/demo`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -83,6 +101,7 @@ function logout() {
   localStorage.removeItem("muai_token");
   authToken = null;
   currentUser = null;
+  if (whSyncTimer) clearInterval(whSyncTimer);
   document.getElementById("app-shell").classList.add("hidden");
   document.getElementById("auth-view").classList.remove("hidden");
 }
@@ -137,7 +156,7 @@ async function refreshMe() {
       `).join("");
     } else {
       document.getElementById("mob-wh-btn").classList.add("hidden");
-      whContainer.innerHTML = `<p class="text-xs text-slate-600 px-2 py-2">No active escrows. Claim a task or lock a deal to spawn an E2EE Wormhole.</p>`;
+      whContainer.innerHTML = `<p class="text-xs text-slate-600 px-2 py-2">No active escrows.</p>`;
     }
 
     const ledgerEl = document.getElementById("ledger-list");
@@ -179,7 +198,7 @@ async function allocateEscrowToCompute() {
   }
 }
 
-async function payFromWallet(dealId, amount, title, counterparty, btnEl) {
+async function payFromWallet(dealId, amount, title, counterparty, peerUserId, btnEl) {
   const orig = btnEl.innerHTML;
   btnEl.innerText = "Locking...";
   btnEl.disabled = true;
@@ -187,7 +206,13 @@ async function payFromWallet(dealId, amount, title, counterparty, btnEl) {
     const res = await fetch(`${API_BASE}/api/escrow/pay-from-wallet`, {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ amount_kes: amount, deal_id: dealId, title: title, counterparty: counterparty })
+      body: JSON.stringify({
+        amount_kes: amount,
+        deal_id: dealId,
+        title: title,
+        counterparty: counterparty,
+        peer_user_id: peerUserId
+      })
     });
     const data = await res.json();
     if (res.ok) {
@@ -224,18 +249,18 @@ function switchTab(tabName) {
   if (tabName === "profile") refreshMe();
 }
 
-// ---------------- CHAT ----------------
+// ---------------- CHAT STREAMING & PERSISTENCE ----------------
 function renderMissionControlCard() {
   return `
     <div class="bg-[#131620] border border-white/10 rounded-2xl p-5">
       <div class="text-xs font-mono text-cyan-400 mb-2">[MISSION CONTROL • MOI UNIVERSITY NODE]</div>
       <p class="text-sm text-slate-200 leading-relaxed mb-4">
-        Your personal <strong>MuAI</strong> orchestrator is active. Upload a past paper for <strong>+25 Aura</strong>, query campus notes, or claim peer bounties in <strong>MyHuman</strong>.
+        Your personal <strong>MuAI</strong> orchestrator is active. Upload a past paper for <strong>+25 Aura</strong>, or test real peer deals with other students!
       </p>
       <div class="flex flex-wrap gap-2">
         <button onclick="sendQuickPrompt('Explain Faraday Law from my PHY 211 notes')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">📚 Explain PHY 211 Faraday Law</button>
-        <button onclick="sendQuickPrompt('Find me a Casio fx-82MS calculator under 1000 KES')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🧮 Buy Casio fx-82MS (&lt;1k KES)</button>
-        <button onclick="sendQuickPrompt('Order fries and soda delivered to Hostel A under 300 KES')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🍟 Order Food to Hostel A</button>
+        <button onclick="sendQuickPrompt('I need a Casio calculator for my CAT today under 1000 KES')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🧮 Buy Casio fx-82MS (&lt;1k KES)</button>
+        <button onclick="sendQuickPrompt('I need some fries and a soda delivered to Hostel B')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🍟 Order Fries &amp; Soda</button>
         <button onclick="sendQuickPrompt('Check my Aura score, compute credits, and recent ledger')" class="text-xs px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 cursor-pointer">🛡️ Check My Aura &amp; Credits</button>
       </div>
     </div>
@@ -259,102 +284,144 @@ async function loadChatHistory() {
 
 function sendQuickPrompt(text) {
   document.getElementById("chat-input").value = text;
-  sendChat();
+  sendChatStream();
 }
 
-async function sendChat() {
+// Real-Time Token Streaming with Staged File Support
+async function sendChatStream() {
   const input = document.getElementById("chat-input");
   const message = input.value.trim();
-  if (!message) return;
+  if (!message && !stagedFile) return;
+
+  const userTextToSend = message || (stagedFile ? `Uploaded ${stagedFile.name}` : "");
   input.value = "";
 
   const box = document.getElementById("chat-messages");
   const userDiv = document.createElement("div");
   userDiv.className = "flex justify-end";
-  userDiv.innerHTML = `<div class="max-w-xl bg-[#1d2130] border border-white/10 rounded-2xl rounded-br-sm px-4 py-3 text-sm text-white">${formatMarkdown(message)}</div>`;
+  userDiv.innerHTML = `
+    <div class="max-w-xl bg-[#1d2130] border border-white/10 rounded-2xl rounded-br-sm px-4 py-3 text-sm text-white">
+      ${stagedFile ? `<div class="text-xs font-mono text-amber-300 mb-1">📄 ${stagedFile.name}</div>` : ''}
+      ${formatMarkdown(userTextToSend)}
+    </div>
+  `;
   box.appendChild(userDiv);
 
   const aiDiv = document.createElement("div");
   aiDiv.className = "flex justify-start";
-  aiDiv.innerHTML = `<div class="max-w-2xl bg-[#12141c] border-l-2 border-cyan-400 rounded-2xl rounded-bl-sm px-4 py-3 text-sm text-slate-300"><span class="text-xs font-mono text-cyan-400 block mb-1">[ADK 2.0 • Recalling pgvector Memory]</span>Processing...</div>`;
+  aiDiv.innerHTML = `
+    <div class="max-w-2xl bg-[#12141c] border-l-2 border-cyan-400 rounded-2xl rounded-bl-sm px-4 py-3 text-sm text-slate-200 leading-relaxed">
+      <span class="text-xs font-mono text-cyan-400 block mb-1">[MuAI DeepSeek V3 Stream]</span>
+      <span class="ai-stream-content text-slate-300">...</span>
+      <div class="ai-stream-widget"></div>
+    </div>
+  `;
   box.appendChild(aiDiv);
   box.scrollTop = box.scrollHeight;
 
+  const contentSpan = aiDiv.querySelector(".ai-stream-content");
+  const widgetBox = aiDiv.querySelector(".ai-stream-widget");
+
+  const formData = new FormData();
+  formData.append("message", userTextToSend);
+  if (stagedFile) {
+    formData.append("file", stagedFile);
+    clearStagedFile();
+  }
+
+  let fullReply = "";
+
   try {
-    const res = await fetch(`${API_BASE}/api/chat`, {
+    const res = await fetch(`${API_BASE}/api/chat/stream`, {
       method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ message })
+      headers: authHeaders(),
+      body: formData
     });
-    const data = await res.json();
 
     if (!res.ok) {
-      aiDiv.innerHTML = `<div class="bg-amber-950/40 border border-amber-500/40 rounded-xl px-4 py-3 text-sm text-amber-200">${data.detail || "Request blocked."}</div>`;
+      const err = await res.json().catch(() => ({}));
+      contentSpan.innerHTML = `<span class="text-amber-300">${err.detail || "Request failed."}</span>`;
       return;
     }
 
-    let widgetHtml = "";
-    if (data.action_widget) {
-      const w = data.action_widget;
-      const safeTitle = (w.title || "").replace(/'/g, "");
-      const safeCounterparty = (w.counterparty || "").replace(/'/g, "");
-      if (w.type === "COMPUTE_TOPUP") {
-        widgetHtml = `
-          <div class="mt-4 bg-[#181c28] border border-amber-400/40 rounded-xl p-4">
-            <div class="font-display font-bold text-amber-300 text-sm mb-2">⚡ ${w.title}</div>
-            <div class="flex flex-wrap gap-2 mt-2">
-              <button onclick="openMpesaModal('topup-20', 20, '2,000 Compute Credits', 'COMPUTE_TOPUP')" class="flex-1 py-2 px-3 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs cursor-pointer">M-Pesa KES 20</button>
-              <button onclick="openMpesaModal('topup-50', 50, '5,000 Compute Credits', 'COMPUTE_TOPUP')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">M-Pesa KES 50</button>
-              <button onclick="switchTab('profile')" class="px-3 py-2 rounded-lg border border-white/15 text-xs text-slate-200 cursor-pointer">Allocate Wallet</button>
-            </div>
-          </div>
-        `;
-      } else if (w.type === "SPNE_DEAL") {
-        const hasWallet = currentUser && (currentUser.wallet_kes >= w.price_kes);
-        widgetHtml = `
-          <div class="mt-4 bg-[#181c28] border border-cyan-400/40 rounded-xl p-4">
-            <div class="font-display font-bold text-cyan-300 text-sm mb-2">🤝 ${w.title}</div>
-            <div class="text-xs text-slate-400 flex justify-between mb-1"><span>Counterparty</span><span class="text-white font-medium">${w.counterparty}</span></div>
-            <div class="text-xs text-slate-400 flex justify-between mb-3"><span>SPNE Price</span><span class="text-emerald-400 font-bold">KES ${w.display_price_kes} (Demo: KES ${w.price_kes})</span></div>
-            <div class="flex flex-wrap gap-2">
-              ${hasWallet ? `<button onclick="payFromWallet('${w.deal_id}', ${w.price_kes}, '${safeTitle}', '${safeCounterparty}', this)" class="flex-1 py-2 px-3 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-bold text-xs cursor-pointer">Lock from Wallet (KES ${w.price_kes})</button>` : ''}
-              <button onclick="openMpesaModal('${w.deal_id}', ${w.price_kes}, '${safeTitle}', 'ESCROW_LOCK')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">
-                Pay via M-Pesa (KES ${w.price_kes})
-              </button>
-              <button onclick="this.closest('.mt-4').remove()" class="px-3 py-2 rounded-lg border border-white/15 text-xs text-slate-300 cursor-pointer">Decline</button>
-            </div>
-          </div>
-        `;
-      } else if (w.type === "REGISTRAR_PETITION") {
-        widgetHtml = `
-          <div class="mt-4 bg-[#181c28] border border-amber-400/40 rounded-xl p-4">
-            <div class="font-display font-bold text-amber-300 text-sm mb-2">📄 ${w.title}</div>
-            <p class="text-xs text-slate-300 mb-3">${w.issue}</p>
-            <button onclick="this.outerHTML='<div class=\\'text-xs text-emerald-400 font-semibold\\'>✓ Dispatched to Registrar MCP</div>'" class="w-full py-2 rounded-lg bg-amber-400 text-slate-950 font-bold text-xs cursor-pointer">
-              Authorize Portal Submission
-            </button>
-          </div>
-        `;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    contentSpan.innerHTML = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const payload = line.slice(6).trim();
+        if (payload === "[DONE]") break;
+
+        try {
+          const parsed = JSON.parse(payload);
+          if (parsed.chunk) {
+            fullReply += parsed.chunk;
+            contentSpan.innerHTML = formatMarkdown(fullReply);
+            box.scrollTop = box.scrollHeight;
+          }
+          if (parsed.action_widget) {
+            renderActionWidget(parsed.action_widget, widgetBox);
+            box.scrollTop = box.scrollHeight;
+          }
+        } catch (e) {}
       }
     }
+  } catch (err) {
+    contentSpan.innerHTML = `<span class="text-rose-400">[Stream Error: ${err.message}]</span>`;
+  }
 
-    aiDiv.innerHTML = `
-      <div class="max-w-2xl bg-[#12141c] border-l-2 border-cyan-400 rounded-2xl rounded-bl-sm px-4 py-3 text-sm text-slate-200 leading-relaxed">
-        <span class="text-xs font-mono text-cyan-400 block mb-1">[MuAI Execution Complete • ${data.memories_recalled || 0} memories recalled]</span>
-        ${formatMarkdown(data.reply)}
-        ${widgetHtml}
+  refreshMe();
+  loadFeed("all");
+}
+
+function renderActionWidget(w, container) {
+  const safeTitle = (w.title || "").replace(/'/g, "");
+  const safeCounterparty = (w.counterparty || "").replace(/'/g, "");
+  const peerUserId = w.peer_user_id || "";
+
+  if (w.type === "COMPUTE_TOPUP") {
+    container.innerHTML = `
+      <div class="mt-4 bg-[#181c28] border border-amber-400/40 rounded-xl p-4">
+        <div class="font-display font-bold text-amber-300 text-sm mb-2">⚡ ${w.title}</div>
+        <div class="flex flex-wrap gap-2 mt-2">
+          <button onclick="openMpesaModal('topup-20', 20, '2k Credits', 'COMPUTE_TOPUP')" class="flex-1 py-2 px-3 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs cursor-pointer">KES 20</button>
+          <button onclick="openMpesaModal('topup-50', 50, '5k Credits', 'COMPUTE_TOPUP')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">KES 50</button>
+          <button onclick="switchTab('profile')" class="px-3 py-2 rounded-lg border border-white/15 text-xs text-slate-200 cursor-pointer">Billing</button>
+        </div>
       </div>
     `;
-    box.scrollTop = box.scrollHeight;
-    refreshMe();
-    loadFeed("all");
-  } catch (e) {
-    aiDiv.innerHTML = `<div class="bg-rose-950/40 border border-rose-500/40 rounded-xl px-4 py-3 text-sm text-rose-300">Error contacting MuAI agent node.</div>`;
+  } else if (w.type === "SPNE_DEAL") {
+    const hasWallet = currentUser && (currentUser.wallet_kes >= w.price_kes);
+    container.innerHTML = `
+      <div class="mt-4 bg-[#181c28] border border-cyan-400/40 rounded-xl p-4">
+        <div class="font-display font-bold text-cyan-300 text-sm mb-2">🤝 ${w.title}</div>
+        <div class="text-xs text-slate-400 flex justify-between mb-1"><span>Counterparty</span><span class="text-white font-medium">${w.counterparty}</span></div>
+        <div class="text-xs text-slate-400 flex justify-between mb-3"><span>SPNE Price</span><span class="text-emerald-400 font-bold">KES ${w.display_price_kes} (Demo: KES ${w.price_kes})</span></div>
+        <div class="flex flex-wrap gap-2">
+          ${hasWallet ? `<button onclick="payFromWallet('${w.deal_id}', ${w.price_kes}, '${safeTitle}', '${safeCounterparty}', '${peerUserId}', this)" class="flex-1 py-2 px-3 rounded-lg bg-emerald-400 hover:bg-emerald-300 text-slate-950 font-bold text-xs cursor-pointer">Lock from Wallet (KES ${w.price_kes})</button>` : ''}
+          <button onclick="openMpesaModal('${w.deal_id}', ${w.price_kes}, '${safeTitle}', 'ESCROW_LOCK', '${peerUserId}')" class="flex-1 py-2 px-3 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer">
+            Pay via M-Pesa (KES ${w.price_kes})
+          </button>
+          <button onclick="this.closest('.mt-4').remove()" class="px-3 py-2 rounded-lg border border-white/15 text-xs text-slate-300 cursor-pointer">Decline</button>
+        </div>
+      </div>
+    `;
   }
 }
 
-// ---------------- SEEDING UPLOAD ----------------
-async function handleFileUpload(inputEl, fromSeedTab = false) {
+// ---------------- SEEDING UPLOAD IN SEED TAB ----------------
+async function handleSeedTabUpload(inputEl) {
   const file = inputEl.files?.[0];
   if (!file) return;
   inputEl.value = "";
@@ -363,15 +430,9 @@ async function handleFileUpload(inputEl, fromSeedTab = false) {
   formData.append("file", file);
 
   const statusBox = document.getElementById("seed-upload-status");
-  if (fromSeedTab && statusBox) {
-    statusBox.className = "rounded-xl p-4 text-sm border border-cyan-500/40 bg-cyan-500/10 text-cyan-300";
-    statusBox.innerText = `⏳ Analyzing "${file.name}", verifying academic quality, and embedding into pgvector...`;
-    statusBox.classList.remove("hidden");
-  } else {
-    const box = document.getElementById("chat-messages");
-    box.innerHTML += `<div class="flex justify-end"><div class="bg-[#1d2130] border border-amber-400/30 rounded-2xl px-4 py-2.5 text-xs text-amber-200">📎 Uploading <strong>${file.name}</strong> to Campus Knowledge Graph...</div></div>`;
-    box.scrollTop = box.scrollHeight;
-  }
+  statusBox.className = "rounded-xl p-4 text-sm border border-cyan-500/40 bg-cyan-500/10 text-cyan-300";
+  statusBox.innerText = `⏳ Analyzing "${file.name}", verifying academic quality, and embedding into pgvector...`;
+  statusBox.classList.remove("hidden");
 
   try {
     const res = await fetch(`${API_BASE}/api/documents/upload`, {
@@ -382,31 +443,18 @@ async function handleFileUpload(inputEl, fromSeedTab = false) {
     const data = await res.json();
 
     if (!res.ok) {
-      const errMsg = data.detail || "Upload rejected.";
-      if (fromSeedTab && statusBox) {
-        statusBox.className = "rounded-xl p-4 text-sm border border-rose-500/40 bg-rose-500/10 text-rose-300";
-        statusBox.innerHTML = `❌ ${errMsg} ${res.status === 402 ? '<button onclick="switchTab(\'profile\')" class="ml-2 underline text-cyan-300 font-bold cursor-pointer">Top Up in Billing &rarr;</button>' : ''}`;
-      } else {
-        alert(errMsg);
-        if (res.status === 402) switchTab("profile");
-      }
+      statusBox.className = "rounded-xl p-4 text-sm border border-rose-500/40 bg-rose-500/10 text-rose-300";
+      statusBox.innerHTML = `❌ ${data.detail || "Upload rejected."}`;
       return;
     }
 
-    const msg = `✅ Seeded <strong>${data.course_code}: ${data.title}</strong> (${data.chunks_indexed} chunks indexed in pgvector). <span class="text-amber-300 font-bold">+${data.aura_minted} Aura Minted!</span>`;
-    if (fromSeedTab && statusBox) {
-      statusBox.className = "rounded-xl p-4 text-sm border border-emerald-500/40 bg-emerald-500/10 text-emerald-200";
-      statusBox.innerHTML = msg;
-    } else {
-      const box = document.getElementById("chat-messages");
-      box.innerHTML += `<div class="flex justify-start"><div class="max-w-2xl bg-[#12141c] border-l-2 border-amber-400 rounded-2xl px-4 py-3 text-sm text-slate-200">${msg}</div></div>`;
-      box.scrollTop = box.scrollHeight;
-    }
+    statusBox.className = "rounded-xl p-4 text-sm border border-emerald-500/40 bg-emerald-500/10 text-emerald-200";
+    statusBox.innerHTML = `✅ Seeded <strong>${data.course_code}: ${data.title}</strong> (${data.chunks_indexed} chunks indexed in pgvector). <span class="text-amber-300 font-bold">+${data.aura_minted} Aura Minted!</span>`;
 
     refreshMe();
     loadLeaderboard();
   } catch (e) {
-    alert("Upload failed: " + e);
+    alert("Upload error: " + e);
   }
 }
 
@@ -534,9 +582,9 @@ async function loadLeaderboard() {
   } catch (e) {}
 }
 
-// ---------------- IN-APP M-PESA MODAL & SMART POLLING ----------------
-function openMpesaModal(dealId, amount, title, purpose = "ESCROW_LOCK") {
-  pendingMpesaTx = { dealId, amount, title, purpose };
+// ---------------- PROACTIVE M-PESA CHECKOUT MODAL ----------------
+function openMpesaModal(dealId, amount, title, purpose = "ESCROW_LOCK", peerUserId = null) {
+  pendingMpesaTx = { dealId, amount, title, purpose, peerUserId };
   document.getElementById("mpesa-modal-subtitle").innerText = title;
   document.getElementById("mpesa-modal-amount").innerText = `KES ${amount}`;
   document.getElementById("mpesa-phone-input").value = (currentUser && currentUser.phone) ? currentUser.phone : "2547";
@@ -570,15 +618,21 @@ async function submitMpesaModal() {
         amount: pendingMpesaTx.amount,
         purpose: pendingMpesaTx.purpose,
         deal_id: pendingMpesaTx.dealId,
-        title: pendingMpesaTx.title
+        title: pendingMpesaTx.title,
+        peer_user_id: pendingMpesaTx.peerUserId
       })
     });
     const data = await res.json();
     if (data.status === "PENDING" && data.invoice_id) {
       document.getElementById("mpesa-form-area").classList.add("hidden");
       const statusBox = document.getElementById("mpesa-status-box");
-      statusBox.className = "rounded-xl p-4 text-sm border border-cyan-500/40 bg-cyan-500/10 text-cyan-200";
-      statusBox.innerHTML = `📱 <strong>PIN Prompt sent to ${phone}</strong>.<br><span class="text-xs text-slate-300">Enter your M-Pesa PIN. Waiting for Safaricom confirmation...</span>`;
+      statusBox.className = "rounded-xl p-4 text-sm border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 space-y-3";
+      statusBox.innerHTML = `
+        <div>📱 <strong>PIN Prompt sent to ${phone}</strong>. Enter your M-Pesa PIN on your phone.</div>
+        <button onclick="checkMpesaNow('${data.invoice_id}', '${pendingMpesaTx.purpose}')" class="w-full py-2 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold text-xs cursor-pointer transition">
+          ⚡ I Have Entered PIN — Verify Now
+        </button>
+      `;
       statusBox.classList.remove("hidden");
       pollInvoiceModal(data.invoice_id, pendingMpesaTx.purpose);
     } else {
@@ -593,17 +647,42 @@ async function submitMpesaModal() {
   }
 }
 
+// Proactive instant-check on button click
+async function checkMpesaNow(invoiceId, purpose) {
+  try {
+    const res = await fetch(`${API_BASE}/api/payment/check-status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ invoice_id: invoiceId })
+    });
+    const data = await res.json();
+    if (data.state === "COMPLETE") {
+      if (activePollTimer) clearInterval(activePollTimer);
+      await refreshMe();
+      const statusBox = document.getElementById("mpesa-status-box");
+      statusBox.className = "rounded-xl p-4 text-sm border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 space-y-3";
+      statusBox.innerHTML = `
+        <div>✅ <strong>Confirmed!</strong> Escrow funded and Wormhole ready.</div>
+        <button onclick="closeMpesaModal(); ${data.wormhole_id ? `openWormhole('${data.wormhole_id}')` : ''}" class="w-full py-2 rounded-lg bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer">
+          Enter E2EE Wormhole &rarr;
+        </button>
+      `;
+    } else {
+      alert(`Status: ${data.state || "PENDING"}. Complete the prompt on your phone first.`);
+    }
+  } catch (e) {
+    alert("Check error: " + e);
+  }
+}
+
 function pollInvoiceModal(invoiceId, purpose) {
   let tries = 0;
   if (activePollTimer) clearInterval(activePollTimer);
-  const statusBox = document.getElementById("mpesa-status-box");
 
   activePollTimer = setInterval(async () => {
     tries++;
-    if (tries > 90) { // 3 minutes max
+    if (tries > 60) {
       clearInterval(activePollTimer);
-      statusBox.className = "rounded-xl p-4 text-sm border border-amber-500/40 bg-amber-500/10 text-amber-200";
-      statusBox.innerText = "⏳ Still awaiting Safaricom callback. If you already paid, your wallet/Wormhole will update automatically via webhook.";
       return;
     }
     try {
@@ -617,48 +696,62 @@ function pollInvoiceModal(invoiceId, purpose) {
       if (data.state === "COMPLETE") {
         clearInterval(activePollTimer);
         await refreshMe();
-        statusBox.className = "rounded-xl p-4 text-sm border border-emerald-500/40 bg-emerald-500/10 text-emerald-200";
+        const statusBox = document.getElementById("mpesa-status-box");
+        statusBox.className = "rounded-xl p-4 text-sm border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 space-y-3";
         if (purpose === "COMPUTE_TOPUP") {
-          statusBox.innerHTML = `✅ <strong>Confirmed!</strong> Compute Credits added to your node.<br><button onclick="closeMpesaModal()" class="mt-3 w-full py-2 rounded-lg bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer">Done</button>`;
+          statusBox.innerHTML = `✅ <strong>Confirmed!</strong> Compute Credits added.<br><button onclick="closeMpesaModal()" class="mt-2 w-full py-2 rounded-lg bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer">Done</button>`;
         } else if (purpose === "WALLET_DEPOSIT") {
-          statusBox.innerHTML = `✅ <strong>Deposit Confirmed!</strong> +10 Aura Minted &amp; Available Wallet updated.<br><button onclick="closeMpesaModal()" class="mt-3 w-full py-2 rounded-lg bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer">Done</button>`;
+          statusBox.innerHTML = `✅ <strong>Deposit Confirmed!</strong> Available Wallet updated.<br><button onclick="closeMpesaModal()" class="mt-2 w-full py-2 rounded-lg bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer">Done</button>`;
         } else {
-          statusBox.innerHTML = `✅ <strong>Escrow Locked!</strong> +15 Aura Minted &amp; E2EE Wormhole spawned.<br><button onclick="closeMpesaModal(); ${data.wormhole_id ? `openWormhole('${data.wormhole_id}')` : ''}" class="mt-3 w-full py-2 rounded-lg bg-cyan-400 text-slate-950 font-bold text-xs cursor-pointer">Enter E2EE Wormhole &rarr;</button>`;
+          statusBox.innerHTML = `✅ <strong>Escrow Locked!</strong> +15 Aura Minted &amp; Wormhole active.<br><button onclick="closeMpesaModal(); ${data.wormhole_id ? `openWormhole('${data.wormhole_id}')` : ''}" class="mt-2 w-full py-2 rounded-lg bg-cyan-400 text-slate-950 font-bold text-xs cursor-pointer">Enter E2EE Wormhole &rarr;</button>`;
         }
       } else if (data.state === "FAILED" || data.state === "CANCELED") {
         clearInterval(activePollTimer);
+        const statusBox = document.getElementById("mpesa-status-box");
         statusBox.className = "rounded-xl p-4 text-sm border border-rose-500/40 bg-rose-500/10 text-rose-200";
-        statusBox.innerHTML = `❌ <strong>Payment ${data.state}:</strong> ${data.failed_reason || "Cancelled on phone."}`;
+        statusBox.innerHTML = `❌ <strong>Payment Failed:</strong> ${data.failed_reason || "Canceled on phone."}`;
       }
     } catch (e) {}
   }, 2000);
 }
 
-// ---------------- WORMHOLES ----------------
+// ---------------- LIVE WORMHOLE TWO-WAY SYNC ----------------
 function openLatestWormhole() {
   if (window._latestWhId) openWormhole(window._latestWhId);
 }
 
 async function openWormhole(whId) {
   activeWormholeId = whId;
-  const res = await fetch(`${API_BASE}/api/wormholes/${whId}`, { headers: authHeaders() });
-  if (!res.ok) return;
-  const data = await res.json();
-  document.getElementById("wh-title").innerText = data.wormhole.title;
-  document.getElementById("wh-escrow").innerText = `Escrow: KES ${data.wormhole.escrow_kes}`;
-
-  document.getElementById("wh-messages").innerHTML = (data.messages || []).map(m => {
-    if (m.sender_role === "arbiter") {
-      return `<div class="p-2.5 rounded-lg border border-dashed border-emerald-500/40 text-emerald-300 font-mono text-[11px] text-center">${m.message}</div>`;
-    }
-    const isMe = currentUser && m.sender_name === currentUser.name;
-    return `<div class="p-3 rounded-xl ${isMe ? 'bg-cyan-500/15 text-cyan-100 self-end ml-auto' : 'bg-[#191d29] text-slate-100 self-start mr-auto'} text-xs max-w-[85%]"><div class="text-[10px] text-cyan-300 font-bold mb-0.5">${m.sender_name}</div>${m.message}</div>`;
-  }).join("");
-
+  await fetchWormholeMessages(whId);
   document.getElementById("wormhole-drawer").classList.remove("hidden");
+
+  // Real-time two-way sync: poll messages every 2.5s while open
+  if (whSyncTimer) clearInterval(whSyncTimer);
+  whSyncTimer = setInterval(() => {
+    if (activeWormholeId) fetchWormholeMessages(activeWormholeId);
+  }, 2500);
+}
+
+async function fetchWormholeMessages(whId) {
+  try {
+    const res = await fetch(`${API_BASE}/api/wormholes/${whId}`, { headers: authHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+    document.getElementById("wh-title").innerText = data.wormhole.title;
+    document.getElementById("wh-escrow").innerText = `Escrow: KES ${data.wormhole.escrow_kes}`;
+
+    document.getElementById("wh-messages").innerHTML = (data.messages || []).map(m => {
+      if (m.sender_role === "arbiter" || m.sender_id === "arbiter") {
+        return `<div class="p-2.5 rounded-lg border border-dashed border-emerald-500/40 text-emerald-300 font-mono text-[11px] text-center">${m.message}</div>`;
+      }
+      const isMe = currentUser && (m.sender_id === currentUser.id || m.sender_name === currentUser.name);
+      return `<div class="p-3 rounded-xl ${isMe ? 'bg-cyan-500/15 text-cyan-100 self-end ml-auto' : 'bg-[#191d29] text-slate-100 self-start mr-auto'} text-xs max-w-[85%]"><div class="text-[10px] text-cyan-300 font-bold mb-0.5">${m.sender_name}</div>${m.message}</div>`;
+    }).join("");
+  } catch (e) {}
 }
 
 function closeWormhole() {
+  if (whSyncTimer) clearInterval(whSyncTimer);
   document.getElementById("wormhole-drawer").classList.add("hidden");
 }
 
@@ -672,7 +765,7 @@ async function sendWormholeMsg() {
     headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ message: msg })
   });
-  openWormhole(activeWormholeId);
+  fetchWormholeMessages(activeWormholeId);
 }
 
 async function releaseCurrentWormhole() {
@@ -684,7 +777,7 @@ async function releaseCurrentWormhole() {
   if (res.ok) {
     closeWormhole();
     await refreshMe();
-    alert("✓ Escrow Released & Wormhole Collapsed! +20 Aura Minted.");
+    alert("✓ Escrow Released! Funds transferred directly to peer seller wallet (+20 Aura).");
   }
 }
 
@@ -694,7 +787,7 @@ window.addEventListener("load", () => {
   const chatInput = document.getElementById("chat-input");
   if (chatInput) {
     chatInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") sendChat();
+      if (e.key === "Enter") sendChatStream();
     });
   }
   const whInput = document.getElementById("wh-input");

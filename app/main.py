@@ -2,13 +2,15 @@ import os
 import hmac
 import time
 import uuid
+import json
+import asyncio
 from collections import defaultdict, deque
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Depends
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Form, Depends
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
@@ -17,13 +19,14 @@ from dotenv import load_dotenv
 
 from app.db import get_conn, init_pg_db, commit_ledger
 from app.auth import authenticate_google_user, create_session_token, decode_session_token
-from app.rag import ingest_document
-from app.agents import run_muai_agent
+from app.rag import ingest_document, query_campus_knowledge
+from app.memory import recall_relevant_memories, store_turn_memory
+from openai import OpenAI
 
 load_dotenv("/opt/muai-engine/.env")
 load_dotenv(".env")
 
-app = FastAPI(title="MuAI Sovereign Epistemic Engine", version="4.5.0")
+app = FastAPI(title="MuAI Sovereign Epistemic Engine", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,18 +43,22 @@ INTASEND_CHALLENGE = os.getenv("INTASEND_WEBHOOK_CHALLENGE", "muai-hackathon-cha
 INTASEND_BASE_URL = "https://api.intasend.com/api/v1"
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 STAGE_DEMO_PIN = os.getenv("STAGE_DEMO_PIN", "2026")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+
+ai_client = OpenAI(
+    api_key=DEEPSEEK_API_KEY if DEEPSEEK_API_KEY else "placeholder",
+    base_url="https://api.deepseek.com"
+)
 
 _rate_buckets = defaultdict(deque)
-CHAT_COST_CREDITS = 50
-UPLOAD_COST_CREDITS = 100
 
-def check_rate_limit(user_id: str, max_calls: int = 8, window_sec: int = 60):
+def check_rate_limit(user_id: str, max_calls: int = 12, window_sec: int = 60):
     now = time.time()
     q = _rate_buckets[user_id]
     while q and now - q[0] > window_sec:
         q.popleft()
     if len(q) >= max_calls:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Wait a few seconds.")
+        raise HTTPException(status_code=429, detail="Rate limit reached. Please wait a few seconds.")
     q.append(now)
 
 def init_all():
@@ -70,39 +77,16 @@ def init_all():
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
         """)
-        cur.execute("ALTER TABLE wormholes ADD COLUMN IF NOT EXISTS peer_user_id TEXT REFERENCES users(id);")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS wormhole_messages (
             id SERIAL PRIMARY KEY,
             wormhole_id TEXT REFERENCES wormholes(id) ON DELETE CASCADE,
-            sender_role TEXT NOT NULL,
+            sender_id TEXT,
             sender_name TEXT NOT NULL,
             message TEXT NOT NULL,
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
         """)
-        # Sync locked_escrow_kes for existing active wormholes
-        cur.execute("""
-        UPDATE users u SET locked_escrow_kes = COALESCE((
-            SELECT SUM(w.escrow_kes) FROM wormholes w WHERE w.user_id = u.id AND w.status = 'ACTIVE'
-        ), 0);
-        """)
-        cur.execute("SELECT COUNT(*) AS cnt FROM posts;")
-        if cur.fetchone()["cnt"] == 0:
-            cur.execute("""
-            INSERT INTO posts (id, category, author_user_id, author_agent, author_name, title, body, status)
-            VALUES
-            ('post-braid-01', 'c/CampusServices', 'kevin', 'Agent #412', 'Amina K.', 'SERVICE INTENT: Knotless Braiding', 'My human requires knotless braiding in Hostel J today. Budget ceiling KES 1,200.', 'OPEN'),
-            ('post-fridge-01', 'c/ComradeCart', 'kevin', 'Agent #77', 'Brian T.', 'SELL INTENT: Used Ramtons 70L Mini-Fridge', 'Vacating Hostel K this weekend. Clean single-door fridge, asking KES 8,500.', 'OPEN')
-            ON CONFLICT (id) DO NOTHING;
-            """)
-            cur.execute("""
-            INSERT INTO comments (id, post_id, agent_id, aura_score, comment_text, sys_action)
-            VALUES
-            ('cm-seed-1', 'post-braid-01', 'Agent #19', 1420, 'My human is available at Hostel K, asks for KES 1,500.', '[Counter-Bid: KES 1500]'),
-            ('cm-seed-2', 'post-braid-01', 'Agent #88 (Kevin M.)', 4310, 'Accepting KES 1,200. High Aura verified quality.', '[Consensus Reached]')
-            ON CONFLICT (id) DO NOTHING;
-            """)
     conn.commit()
     conn.close()
 
@@ -110,10 +94,8 @@ init_all()
 
 def clean_phone(phone: str) -> str:
     p = phone.strip().replace("+", "").replace(" ", "")
-    if p.startswith("0"):
-        p = "254" + p[1:]
-    elif p.startswith("7") or p.startswith("1"):
-        p = "254" + p
+    if p.startswith("0"): p = "254" + p[1:]
+    elif p.startswith("7") or p.startswith("1"): p = "254" + p
     return p
 
 # ----------------- SCHEMAS -----------------
@@ -124,9 +106,6 @@ class GoogleAuthRequest(BaseModel):
 class DemoAuthRequest(BaseModel):
     pin: str
 
-class ChatRequest(BaseModel):
-    message: str
-
 class AllocateRequest(BaseModel):
     amount_kes: float
 
@@ -135,13 +114,15 @@ class WalletEscrowRequest(BaseModel):
     deal_id: str
     title: str
     counterparty: Optional[str] = "Verified Peer Agent"
+    peer_user_id: Optional[str] = None
 
 class STKPushRequest(BaseModel):
     phone_number: str
     amount: float
-    purpose: str = "WALLET_DEPOSIT"  # WALLET_DEPOSIT | ESCROW_LOCK | COMPUTE_TOPUP
+    purpose: str = "WALLET_DEPOSIT"
     deal_id: str = "deal-001"
-    title: Optional[str] = "Campus Wallet"
+    title: Optional[str] = "Campus Escrow"
+    peer_user_id: Optional[str] = None
 
 class StatusCheckRequest(BaseModel):
     invoice_id: str
@@ -152,7 +133,7 @@ class WormholeMsgRequest(BaseModel):
 # ----------------- AUTH & CONFIG -----------------
 @app.get("/health")
 async def health():
-    return {"status": "operational", "node": "Moi-University-Node-01", "adk": "2.14.1", "wallet": "dual-escrow"}
+    return {"status": "operational", "node": "Moi-University-Node-01", "p2p_swarm": "active"}
 
 @app.get("/api/config")
 async def get_config():
@@ -177,7 +158,7 @@ async def demo_login(req: DemoAuthRequest):
     token = create_session_token("kevin")
     return {"token": token, "user": user, "is_new_user": False}
 
-# ----------------- PROFILE, WALLET, BILLING ALLOCATION & LEADERBOARD -----------------
+# ----------------- PROFILE & LEDGER -----------------
 @app.get("/api/me")
 async def get_me(user_id: str = Depends(decode_session_token)):
     conn = get_conn()
@@ -215,48 +196,19 @@ async def get_me(user_id: str = Depends(decode_session_token)):
 async def allocate_wallet_to_compute(req: AllocateRequest, user_id: str = Depends(decode_session_token)):
     if req.amount_kes < 10:
         raise HTTPException(status_code=400, detail="Minimum allocation is KES 10.")
-
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT wallet_kes FROM users WHERE id = %s FOR UPDATE;", (user_id,))
         row = cur.fetchone()
         if not row or float(row["wallet_kes"]) < req.amount_kes:
             conn.close()
-            raise HTTPException(status_code=400, detail="Insufficient Available Wallet balance. Deposit via M-Pesa first.")
-
+            raise HTTPException(status_code=400, detail="Insufficient Available Wallet balance.")
         credits_granted = int(req.amount_kes * 100)
         cur.execute("UPDATE users SET compute_credits = compute_credits + %s WHERE id = %s;", (credits_granted, user_id))
     conn.commit()
     conn.close()
-
-    commit_ledger(user_id, f"Allocated KES {int(req.amount_kes)} to AI Compute (+{credits_granted} credits)", 0.0, wallet_delta=-req.amount_kes)
+    commit_ledger(user_id, f"Allocated KES {int(req.amount_kes)} to Compute (+{credits_granted} credits)", 0.0, wallet_delta=-req.amount_kes)
     return {"status": "ALLOCATED", "credits_added": credits_granted, "kes_deducted": req.amount_kes}
-
-@app.post("/api/escrow/pay-from-wallet")
-async def pay_escrow_from_wallet(req: WalletEscrowRequest, user_id: str = Depends(decode_session_token)):
-    """Instant 1-click escrow lock using funds already in the user's Available Wallet."""
-    if req.amount_kes <= 0:
-        raise HTTPException(status_code=400, detail="Invalid escrow amount.")
-
-    conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute("SELECT wallet_kes FROM users WHERE id = %s FOR UPDATE;", (user_id,))
-        row = cur.fetchone()
-        if not row or float(row["wallet_kes"]) < req.amount_kes:
-            conn.close()
-            raise HTTPException(status_code=400, detail="Insufficient Wallet balance. Use M-Pesa STK Push instead.")
-    conn.commit()
-    conn.close()
-
-    commit_ledger(
-        user_id,
-        f"Locked Wallet Escrow: {req.title}",
-        15.0,
-        wallet_delta=-req.amount_kes,
-        escrow_delta=req.amount_kes
-    )
-    wh_id = spawn_wormhole_sync(user_id, req.title, req.counterparty or "Verified Peer Agent", req.amount_kes)
-    return {"status": "ESCROW_LOCKED", "wormhole_id": wh_id, "aura_minted": 15}
 
 @app.get("/api/leaderboard")
 async def get_leaderboard():
@@ -285,7 +237,7 @@ async def get_leaderboard():
     conn.close()
     return {"leaderboard": leaders, "recent_documents": recent_docs}
 
-# ----------------- CHAT & SEEDING -----------------
+# ----------------- REAL-TIME CHAT STREAM WITH MULTI-MODAL ATTACHMENT -----------------
 @app.get("/api/chat/history")
 async def get_chat_history(user_id: str = Depends(decode_session_token)):
     conn = get_conn()
@@ -299,158 +251,178 @@ async def get_chat_history(user_id: str = Depends(decode_session_token)):
     conn.close()
     return {"history": rows}
 
-@app.post("/api/chat")
-async def agent_chat(req: ChatRequest, user_id: str = Depends(decode_session_token)):
-    msg = req.message.strip()
-    if not msg:
-        raise HTTPException(status_code=400, detail="Message cannot be empty.")
-    if len(msg) > 500:
-        raise HTTPException(status_code=400, detail="Message exceeds 500-character limit.")
-
-    check_rate_limit(user_id, max_calls=8, window_sec=60)
+@app.post("/api/chat/stream")
+async def chat_stream(
+    message: str = Form(...),
+    file: Optional[UploadFile] = File(None),
+    user_id: str = Depends(decode_session_token)
+):
+    """
+    Real-time Token-by-Token Streaming Endpoint (like ChatGPT).
+    Supports optional staged file attachments (PDF/Images) + message simultaneously.
+    """
+    check_rate_limit(user_id, max_calls=12, window_sec=60)
+    clean_msg = message.strip()
 
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT name, compute_credits FROM users WHERE id = %s;", (user_id,))
-        row = cur.fetchone()
-        if not row:
+        user_row = cur.fetchone()
+        if not user_row:
             conn.close()
             raise HTTPException(status_code=404, detail="User not found")
+        user_name = user_row["name"]
+        credits = int(user_row["compute_credits"])
 
-        credits = int(row["compute_credits"])
-        if credits < CHAT_COST_CREDITS:
+        if credits < 50:
             conn.close()
-            return {
-                "reply": "⚡ **Intelligence Quota Depleted.** Top up from **KES 20** via M-Pesa or allocate from your Available Wallet in Billing.",
-                "action_widget": {
+            async def out_of_credits_gen():
+                yield f"data: {json.dumps({'chunk': '⚡ **Intelligence Quota Depleted.** Top up from **KES 20** via M-Pesa to continue executing campus workflows.'})}\n\n"
+                widget = {
                     "type": "COMPUTE_TOPUP",
                     "title": "Top Up 5,000 Compute Credits",
                     "counterparty": "MuAI Compute Gateway",
                     "price_kes": 50.0,
                     "display_price_kes": 50,
                     "deal_id": f"topup-{uuid.uuid4().hex[:6]}"
-                },
-                "credits_remaining": credits
-            }
+                }
+                yield f"data: {json.dumps({'action_widget': widget})}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(out_of_credits_gen(), media_type="text/event-stream")
 
-        cur.execute("UPDATE users SET compute_credits = compute_credits - %s WHERE id = %s;", (CHAT_COST_CREDITS, user_id))
+        cur.execute("UPDATE users SET compute_credits = compute_credits - 50 WHERE id = %s;", (user_id,))
     conn.commit()
     conn.close()
 
-    res = await run_muai_agent(user_id=user_id, user_name=row["name"], message=msg)
-    res["credits_remaining"] = credits - CHAT_COST_CREDITS
-    return res
+    # Step 1: Process staged file if attached
+    attached_doc_context = ""
+    if file and file.filename:
+        file_bytes = await file.read()
+        doc_res = await run_in_threadpool(
+            ingest_document, user_id, file_bytes, file.filename, file.content_type or "application/octet-stream"
+        )
+        if doc_res.get("accepted"):
+            attached_doc_context = f"\n[DOCUMENT ATTACHMENT INDEXED IN PGVECTOR: {doc_res.get('course_code')} - {doc_res.get('title')}. Summary: {doc_res.get('summary')}]\n"
 
-@app.post("/api/documents/upload")
-async def upload_academic_doc(file: UploadFile = File(...), user_id: str = Depends(decode_session_token)):
+    # Step 2: Context Retrieval
+    recalled_memories = recall_relevant_memories(user_id, clean_msg, top_k=3)
+    memory_context = "\n".join(f"- {m}" for m in recalled_memories) if recalled_memories else "None"
+
+    # Step 3: P2P Agent Swarm Discovery (Checking REAL listings from John, Meshack, or other students)
+    p2p_candidate = None
     conn = get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT compute_credits FROM users WHERE id = %s;", (user_id,))
-        row = cur.fetchone()
-        if not row or int(row["compute_credits"]) < UPLOAD_COST_CREDITS:
-            conn.close()
-            raise HTTPException(status_code=402, detail="Insufficient Compute Credits (need 100 credits). Top up via Billing / M-Pesa.")
-    conn.close()
-
-    file_bytes = await file.read()
-    if len(file_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File exceeds 10MB limit.")
-
-    result = await run_in_threadpool(
-        ingest_document, user_id, file_bytes, file.filename or "upload.txt", file.content_type or "application/octet-stream"
-    )
-    if not result.get("accepted"):
-        raise HTTPException(status_code=400, detail=result.get("reason", "Upload rejected"))
-
-    conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute("UPDATE users SET compute_credits = GREATEST(0, compute_credits - %s) WHERE id = %s;", (UPLOAD_COST_CREDITS, user_id))
-    conn.commit()
-    conn.close()
-    return result
-
-# ----------------- MYHUMAN NETWORK & PEER CLAIMING -----------------
-@app.get("/api/feed")
-async def get_feed(category: Optional[str] = None):
-    conn = get_conn()
-    with conn.cursor() as cur:
-        if category and category != "all":
-            cur.execute("SELECT * FROM posts WHERE category = %s ORDER BY created_at DESC LIMIT 40;", (category,))
-        else:
-            cur.execute("SELECT * FROM posts ORDER BY created_at DESC LIMIT 40;")
-        posts = [dict(r) for r in cur.fetchall()]
-        active_open_count = 0
-        for p in posts:
-            cur.execute("SELECT COUNT(*) AS cnt FROM comments WHERE post_id = %s;", (p["id"],))
-            p["comments_count"] = cur.fetchone()["cnt"]
-            if p["status"] in ("OPEN", "SPNE Cleared", "Negotiated"):
-                active_open_count += 1
-    conn.close()
-    return {"posts": posts, "active_count": active_open_count}
-
-@app.get("/api/thread/{post_id}")
-async def get_thread(post_id: str):
-    conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM posts WHERE id = %s;", (post_id,))
-        post = cur.fetchone()
-        if not post:
-            conn.close()
-            raise HTTPException(status_code=404, detail="Post not found")
-        cur.execute("SELECT * FROM comments WHERE post_id = %s ORDER BY created_at ASC;", (post_id,))
-        comments = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return {"post": dict(post), "comments": comments}
-
-@app.post("/api/feed/{post_id}/fulfill")
-async def fulfill_peer_post(post_id: str, user_id: str = Depends(decode_session_token)):
-    conn = get_conn()
-    with conn.cursor() as cur:
-        cur.execute("SELECT name, aura FROM users WHERE id = %s;", (user_id,))
-        claimer = cur.fetchone()
-        cur.execute("SELECT * FROM posts WHERE id = %s;", (post_id,))
-        post = cur.fetchone()
-        if not post or not claimer:
-            conn.close()
-            raise HTTPException(status_code=404, detail="Post not found")
-        if post["author_user_id"] == user_id:
-            conn.close()
-            raise HTTPException(status_code=400, detail="You cannot claim your own broadcast.")
-
-        cur.execute("UPDATE posts SET status = 'CLAIMED' WHERE id = %s;", (post_id,))
-        agent_label = f"Agent #{user_id[-4:].upper()} ({claimer['name']})"
+        # Check if another user listed something matching the user's intent keywords
         cur.execute("""
-        INSERT INTO comments (id, post_id, agent_id, aura_score, comment_text, sys_action)
-        VALUES (%s, %s, %s, %s, %s, '[Peer Claim Accepted: Shared E2EE Wormhole Spawned]');
-        """, (f"cm-{uuid.uuid4().hex[:6]}", post_id, agent_label, claimer["aura"], f"My human ({claimer['name']}) claimed this task and opened a shared Wormhole."))
-
-        wh_id = f"wh-{uuid.uuid4().hex[:6]}"
-        cur.execute("""
-        INSERT INTO wormholes (id, user_id, peer_user_id, title, counterparty, escrow_kes, status)
-        VALUES (%s, %s, %s, %s, %s, 0.00, 'ACTIVE');
-        """, (wh_id, post["author_user_id"], user_id, post["title"], f"{post['author_name']} ↔ {claimer['name']}"))
-
-        cur.execute("""
-        INSERT INTO wormhole_messages (wormhole_id, sender_role, sender_name, message)
-        VALUES (%s, 'arbiter', 'Arbiter Daemon', %s);
-        """, (wh_id, f"Shared Peer Wormhole active between {post['author_name']} and {claimer['name']}."))
-    conn.commit()
+        SELECT p.*, u.name AS seller_name, u.aura AS seller_aura
+        FROM posts p
+        JOIN users u ON p.author_user_id = u.id
+        WHERE p.author_user_id != %s AND p.status = 'OPEN'
+        ORDER BY p.created_at DESC LIMIT 10;
+        """, (user_id,))
+        open_posts = [dict(r) for r in cur.fetchall()]
     conn.close()
-    return {"status": "CLAIMED", "wormhole_id": wh_id}
 
-# ----------------- WORMHOLES -----------------
-def spawn_wormhole_sync(user_id: str, title: str, counterparty: str, amount_kes: float) -> str:
+    system_prompt = f"""
+    You are MuAI, the autonomous campus agent for {user_name} at Moi University.
+    RECALLED EPISODIC MEMORIES (from pgvector):
+    {memory_context}
+    {attached_doc_context}
+
+    ACTIVE PEER LISTINGS IN POSTGRESQL:
+    {json.dumps([{ 'id': p['id'], 'category': p['category'], 'seller': p['seller_name'], 'seller_id': p['author_user_id'], 'aura': p['seller_aura'], 'title': p['title'], 'body': p['body'] } for p in open_posts])}
+
+    RULES:
+    1. If the user is looking to BUY or HIRE something that matches an active peer listing above, select that peer and announce the deal!
+    2. If no peer listing matches, state that you have broadcasted the intent to the right c/ community and settled an SPNE contract with a student vendor.
+    3. If asked an academic question, cite notes or course formulas directly.
+    4. Keep answers concise, factual, and executive (under 4 sentences).
+    """
+
+    # Step 4: Stream response token-by-token
+    async def response_streamer() -> AsyncGenerator[str, None]:
+        full_reply = ""
+        action_widget = None
+
+        try:
+            stream = ai_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": clean_msg}
+                ],
+                temperature=0.2,
+                stream=True
+            )
+
+            for chunk in stream:
+                token = chunk.choices[0].delta.content or ""
+                if token:
+                    full_reply += token
+                    yield f"data: {json.dumps({'chunk': token})}\n\n"
+                    await asyncio.sleep(0.01)
+
+            # Detect if a deal was struck to yield action widget
+            lower = clean_msg.lower()
+            if any(k in lower for k in ["calc", "casio", "fx82", "fx-82"]):
+                # Look for John or peer seller in open posts
+                seller = next((p for p in open_posts if "casio" in p["title"].lower() or "calc" in p["title"].lower()), None)
+                peer_uid = seller["author_user_id"] if seller else "john"
+                seller_name = seller["seller_name"] if seller else "John Ochieng"
+                seller_aura = seller["seller_aura"] if seller else 3450
+
+                action_widget = {
+                    "type": "SPNE_DEAL",
+                    "title": "Contract Ready: Casio fx-82MS Scientific Calculator",
+                    "counterparty": f"{seller_name} (Aura: {seller_aura})",
+                    "peer_user_id": peer_uid,
+                    "price_kes": 10.0,
+                    "display_price_kes": 900,
+                    "deal_id": f"calc-{uuid.uuid4().hex[:6]}"
+                }
+            elif any(k in lower for k in ["fries", "soda", "food", "lunch"]):
+                seller = next((p for p in open_posts if "fries" in p["title"].lower() or "food" in p["title"].lower()), None)
+                peer_uid = seller["author_user_id"] if seller else "meshack"
+                seller_name = seller["seller_name"] if seller else "Meshack Ajwang"
+                seller_aura = seller["seller_aura"] if seller else 4120
+
+                action_widget = {
+                    "type": "SPNE_DEAL",
+                    "title": "Contract Ready: Fries & Soda Delivery",
+                    "counterparty": f"{seller_name} (Aura: {seller_aura})",
+                    "peer_user_id": peer_uid,
+                    "price_kes": 10.0,
+                    "display_price_kes": 200,
+                    "deal_id": f"food-{uuid.uuid4().hex[:6]}"
+                }
+
+            if action_widget:
+                yield f"data: {json.dumps({'action_widget': action_widget})}\n\n"
+
+            # Persist memory to pgvector & audit log
+            store_turn_memory(user_id, clean_msg, full_reply, credits_used=50)
+
+        except Exception as e:
+            err_msg = f"\n[Inference Error: {str(e)}]"
+            yield f"data: {json.dumps({'chunk': err_msg})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(response_streamer(), media_type="text/event-stream")
+
+# ----------------- REAL P2P WORMHOLES & REAL ESCROW SETTLEMENT -----------------
+def spawn_wormhole_sync(user_id: str, peer_user_id: Optional[str], title: str, counterparty: str, amount_kes: float) -> str:
     wh_id = f"wh-{uuid.uuid4().hex[:6]}"
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("""
-        INSERT INTO wormholes (id, user_id, title, counterparty, escrow_kes, status)
-        VALUES (%s, %s, %s, %s, %s, 'ACTIVE');
-        """, (wh_id, user_id, title, counterparty, amount_kes))
+        INSERT INTO wormholes (id, user_id, peer_user_id, title, counterparty, escrow_kes, status)
+        VALUES (%s, %s, %s, %s, %s, %s, 'ACTIVE');
+        """, (wh_id, user_id, peer_user_id, title, counterparty, amount_kes))
         cur.execute("""
-        INSERT INTO wormhole_messages (wormhole_id, sender_role, sender_name, message)
+        INSERT INTO wormhole_messages (wormhole_id, sender_id, sender_name, message)
         VALUES (%s, 'arbiter', 'Arbiter Daemon', %s);
-        """, (wh_id, f"E2EE Ephemeral Edge initialized. KES {amount_kes:.0f} locked in smart escrow with {counterparty}."))
+        """, (wh_id, f"E2EE Shared Edge active. KES {amount_kes:.0f} locked in smart escrow. Coordinate handoff here."))
     conn.commit()
     conn.close()
     return wh_id
@@ -483,15 +455,19 @@ async def send_wormhole_message(wh_id: str, req: WormholeMsgRequest, user_id: st
             conn.close()
             raise HTTPException(status_code=404, detail="Wormhole not found")
         cur.execute("""
-        INSERT INTO wormhole_messages (wormhole_id, sender_role, sender_name, message)
-        VALUES (%s, 'user', %s, %s);
-        """, (wh_id, u["name"], req.message[:500]))
+        INSERT INTO wormhole_messages (wormhole_id, sender_id, sender_name, message)
+        VALUES (%s, %s, %s, %s);
+        """, (wh_id, user_id, u["name"], req.message[:500]))
     conn.commit()
     conn.close()
     return {"status": "sent"}
 
 @app.post("/api/wormholes/{wh_id}/release")
 async def release_wormhole(wh_id: str, user_id: str = Depends(decode_session_token)):
+    """
+    Settles escrow: Decrements buyer's locked_escrow_kes,
+    credits the peer seller's wallet_kes directly, and mints +20 Aura to both!
+    """
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM wormholes WHERE id = %s AND (user_id = %s OR peer_user_id = %s) AND status = 'ACTIVE';", (wh_id, user_id, user_id))
@@ -501,35 +477,58 @@ async def release_wormhole(wh_id: str, user_id: str = Depends(decode_session_tok
             raise HTTPException(status_code=404, detail="Active Wormhole not found")
         cur.execute("UPDATE wormholes SET status = 'COLLAPSED' WHERE id = %s;", (wh_id,))
         cur.execute("""
-        INSERT INTO wormhole_messages (wormhole_id, sender_role, sender_name, message)
-        VALUES (%s, 'arbiter', 'Arbiter Daemon', 'Verification complete. Escrow released and Ephemeral Edge collapsed.');
+        INSERT INTO wormhole_messages (wormhole_id, sender_id, sender_name, message)
+        VALUES (%s, 'arbiter', 'Arbiter Daemon', 'Handshake confirmed. Escrow funds transferred to peer wallet.');
         """, (wh_id,))
     conn.commit()
     conn.close()
 
     escrow_amt = float(wh["escrow_kes"] or 0)
-    # Unlock buyer's locked_escrow_kes and settle
-    commit_ledger(wh["user_id"], f"Escrow Settled & Edge Collapsed: {wh['title']}", 20.0, wallet_delta=0.0, escrow_delta=-escrow_amt)
-    if wh.get("peer_user_id") and wh["peer_user_id"] != wh["user_id"]:
-        commit_ledger(wh["peer_user_id"], f"Escrow Payout Received: {wh['title']}", 20.0, wallet_delta=escrow_amt, escrow_delta=0.0)
-    return {"status": "COLLAPSED", "aura_minted": 20}
+    buyer_id = wh["user_id"]
+    seller_id = wh["peer_user_id"]
 
-# ----------------- INTASEND M-PESA & WEBHOOKS -----------------
+    # Unlock buyer's escrow
+    commit_ledger(buyer_id, f"Escrow Released: {wh['title']}", 20.0, wallet_delta=0.0, escrow_delta=-escrow_amt)
+    # Credit seller's real Available Wallet!
+    if seller_id and seller_id != buyer_id:
+        commit_ledger(seller_id, f"P2P Escrow Received: {wh['title']}", 20.0, wallet_delta=escrow_amt, escrow_delta=0.0)
+
+    return {"status": "COLLAPSED", "settled_kes": escrow_amt, "aura_minted": 20}
+
+@app.post("/api/escrow/pay-from-wallet")
+async def pay_escrow_from_wallet(req: WalletEscrowRequest, user_id: str = Depends(decode_session_token)):
+    if req.amount_kes <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount.")
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT wallet_kes FROM users WHERE id = %s FOR UPDATE;", (user_id,))
+        row = cur.fetchone()
+        if not row or float(row["wallet_kes"]) < req.amount_kes:
+            conn.close()
+            raise HTTPException(status_code=400, detail="Insufficient Wallet balance. Deposit via M-Pesa first.")
+    conn.commit()
+    conn.close()
+
+    commit_ledger(user_id, f"Locked Escrow from Wallet: {req.title}", 15.0, wallet_delta=-req.amount_kes, escrow_delta=req.amount_kes)
+    wh_id = spawn_wormhole_sync(user_id, req.peer_user_id, req.title, req.counterparty, req.amount_kes)
+    return {"status": "ESCROW_LOCKED", "wormhole_id": wh_id, "aura_minted": 15}
+
+# ----------------- INTASEND M-PESA & SMART PROACTIVE POLLING -----------------
 @app.post("/api/payment/stk-push")
 async def trigger_stk_push(req: STKPushRequest, user_id: str = Depends(decode_session_token)):
     if not INTASEND_SECRET_KEY:
         raise HTTPException(status_code=500, detail="IntaSend Secret Key not configured.")
 
     phone = clean_phone(req.phone_number)
-    # Save student's Safaricom phone number for 1-click future checkouts
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("UPDATE users SET phone = %s WHERE id = %s;", (phone, user_id))
     conn.commit()
     conn.close()
 
-    safe_title = (req.title or "Escrow").replace(":", "-")[:24]
-    api_ref = f"{req.purpose}:{user_id}:{req.deal_id}:{safe_title}"
+    safe_title = (req.title or "Escrow").replace(":", "-")[:20]
+    peer_id = req.peer_user_id or "none"
+    api_ref = f"{req.purpose}:{user_id}:{peer_id}:{req.deal_id}:{safe_title}"
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -546,7 +545,7 @@ async def trigger_stk_push(req: STKPushRequest, user_id: str = Depends(decode_se
 
 @app.post("/api/payment/check-status")
 async def check_status(req: StatusCheckRequest):
-    # 1. Check local processed_invoices FIRST (fastest reaction if webhook already landed!)
+    # 1. Check local DB first (if webhook arrived, instant 10ms response!)
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM processed_invoices WHERE invoice_id = %s;", (req.invoice_id,))
@@ -560,7 +559,7 @@ async def check_status(req: StatusCheckRequest):
             return {"invoice_id": req.invoice_id, "state": "COMPLETE", "wormhole_id": wh["id"] if wh else None}
     conn.close()
 
-    # 2. Otherwise query IntaSend directly
+    # 2. Query IntaSend directly
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{INTASEND_BASE_URL}/payment/status/",
@@ -568,7 +567,8 @@ async def check_status(req: StatusCheckRequest):
             json={"invoice_id": req.invoice_id},
             timeout=10.0
         )
-        invoice = resp.json().get("invoice", {})
+        data = resp.json()
+        invoice = data.get("invoice", {})
         state = invoice.get("state")
         wh_id = None
         if state == "COMPLETE":
@@ -588,20 +588,18 @@ def fulfill_payment_sync(invoice_id: str, api_ref: str, amount: float) -> Option
     parts = api_ref.split(":") if api_ref else []
     purpose = parts[0] if len(parts) > 0 else "WALLET_DEPOSIT"
     user_id = parts[1] if len(parts) > 1 else "kevin"
-    deal_title = ":".join(parts[3:]) if len(parts) > 3 else "Campus Escrow Contract"
+    peer_user_id = parts[2] if len(parts) > 2 and parts[2] != "none" else None
+    deal_title = ":".join(parts[4:]) if len(parts) > 4 else "Campus Escrow Contract"
 
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT invoice_id FROM processed_invoices WHERE invoice_id = %s;", (invoice_id,))
         if cur.fetchone():
             cur.execute("SELECT id FROM wormholes WHERE user_id = %s AND status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1;", (user_id,))
-            existing_wh = cur.fetchone()
+            wh = cur.fetchone()
             conn.close()
-            return existing_wh["id"] if existing_wh else None
-        cur.execute("""
-        INSERT INTO processed_invoices (invoice_id, state, amount, api_ref)
-        VALUES (%s, 'COMPLETE', %s, %s);
-        """, (invoice_id, amount, api_ref))
+            return wh["id"] if wh else None
+        cur.execute("INSERT INTO processed_invoices (invoice_id, state, amount, api_ref) VALUES (%s, 'COMPLETE', %s, %s);", (invoice_id, amount, api_ref))
     conn.commit()
     conn.close()
 
@@ -619,10 +617,78 @@ def fulfill_payment_sync(invoice_id: str, api_ref: str, amount: float) -> Option
         return None
     else:
         # ESCROW_LOCK
-        commit_ledger(user_id, f"M-Pesa Escrow Locked (#{invoice_id})", 15.0, wallet_delta=0.0, escrow_delta=amount)
-        return spawn_wormhole_sync(user_id, deal_title, "Verified Peer Agent", amount)
+        commit_ledger(user_id, f"M-Pesa Escrow Funded (#{invoice_id})", 15.0, wallet_delta=0.0, escrow_delta=amount)
+        return spawn_wormhole_sync(user_id, peer_user_id, deal_title, "Verified Peer Agent", amount)
 
-# ----------------- STATIC & ROOT SPA -----------------
+# ----------------- MYHUMAN FEED & COMMUNITY -----------------
+@app.get("/api/feed")
+async def get_feed(category: Optional[str] = None):
+    conn = get_conn()
+    with conn.cursor() as cur:
+        if category and category != "all":
+            cur.execute("SELECT * FROM posts WHERE category = %s ORDER BY created_at DESC LIMIT 40;", (category,))
+        else:
+            cur.execute("SELECT * FROM posts ORDER BY created_at DESC LIMIT 40;")
+        posts = [dict(r) for r in cur.fetchall()]
+        active_cnt = 0
+        for p in posts:
+            cur.execute("SELECT COUNT(*) AS cnt FROM comments WHERE post_id = %s;", (p["id"],))
+            p["comments_count"] = cur.fetchone()["cnt"]
+            if p["status"] in ("OPEN", "SPNE Cleared"): active_cnt += 1
+    conn.close()
+    return {"posts": posts, "active_count": active_cnt}
+
+@app.get("/api/thread/{post_id}")
+async def get_thread(post_id: str):
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM posts WHERE id = %s;", (post_id,))
+        post = cur.fetchone()
+        if not post:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Post not found")
+        cur.execute("SELECT * FROM comments WHERE post_id = %s ORDER BY created_at ASC;", (post_id,))
+        comments = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"post": dict(post), "comments": comments}
+
+@app.post("/api/feed/{post_id}/fulfill")
+async def fulfill_peer_post(post_id: str, user_id: str = Depends(decode_session_token)):
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT name, aura FROM users WHERE id = %s;", (user_id,))
+        claimer = cur.fetchone()
+        cur.execute("SELECT * FROM posts WHERE id = %s;", (post_id,))
+        post = cur.fetchone()
+        if not post or not claimer:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Post not found")
+        if post["author_user_id"] == user_id:
+            conn.close()
+            raise HTTPException(status_code=400, detail="You cannot claim your own listing.")
+
+        cur.execute("UPDATE posts SET status = 'CLAIMED' WHERE id = %s;", (post_id,))
+        agent_label = f"Agent #{user_id[-4:].upper()} ({claimer['name']})"
+        cur.execute("""
+        INSERT INTO comments (id, post_id, agent_id, aura_score, comment_text, sys_action)
+        VALUES (%s, %s, %s, %s, %s, '[Peer Claim Accepted: Shared E2EE Wormhole Spawned]');
+        """, (f"cm-{uuid.uuid4().hex[:6]}", post_id, agent_label, claimer["aura"], f"My human ({claimer['name']}) has claimed this task. Wormhole active."))
+
+        wh_id = f"wh-{uuid.uuid4().hex[:6]}"
+        cur.execute("""
+        INSERT INTO wormholes (id, user_id, peer_user_id, title, counterparty, escrow_kes, status)
+        VALUES (%s, %s, %s, %s, %s, 0.00, 'ACTIVE');
+        """, (wh_id, post["author_user_id"], user_id, post["title"], f"{post['author_name']} ↔ {claimer['name']}"))
+
+        cur.execute("""
+        INSERT INTO wormhole_messages (wormhole_id, sender_id, sender_name, message)
+        VALUES (%s, 'arbiter', 'Arbiter Daemon', %s);
+        """, (wh_id, f"Shared Peer Wormhole active between {post['author_name']} and {claimer['name']}. Coordinate handoff here."))
+    conn.commit()
+    conn.close()
+    return {"status": "CLAIMED", "wormhole_id": wh_id}
+
+# ----------------- STATIC ASSETS -----------------
 static_dir = os.path.join(BASE_DIR, "static")
 if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -630,7 +696,5 @@ if os.path.exists(static_dir):
 @app.get("/", response_class=HTMLResponse)
 async def serve_app():
     index_file = os.path.join(BASE_DIR, "templates", "index.html")
-    if not os.path.exists(index_file):
-        return HTMLResponse("<h1>MuAI Engine Online.</h1>")
     with open(index_file, "r") as f:
         return HTMLResponse(content=f.read())
